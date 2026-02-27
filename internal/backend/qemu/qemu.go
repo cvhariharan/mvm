@@ -8,7 +8,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"sync"
 	"syscall"
@@ -77,7 +76,7 @@ func (q *QEMU) Create(ctx context.Context, cfg *backend.VMConfig) (*backend.VM, 
 }
 
 // Start launches the QEMU process and returns immediately.
-// Sets vm.Pid. Call Attach() to block until exit with console I/O.
+// Sets vm.Pid. Call Attach() to bridge the console, or Wait() to get the exit code.
 func (q *QEMU) Start(ctx context.Context, vm *backend.VM, cfg *backend.VMConfig) error {
 	// Remove stale sockets from a previous run
 	os.Remove(vm.CtrlSocket)
@@ -109,9 +108,17 @@ func (q *QEMU) Start(ctx context.Context, vm *backend.VM, cfg *backend.VMConfig)
 	return nil
 }
 
-// Attach connects to the VM's serial console socket, bridges it to the
-// terminal, and blocks until the VM exits. Returns the guest exit code.
-func (q *QEMU) Attach(ctx context.Context, vm *backend.VM, cfg *backend.VMConfig) (int, error) {
+// Attach bridges the VM's serial console to the host terminal.
+// Returns when the user disconnects (e.g. Ctrl+D, stdin EOF).
+// The VM keeps running — this does NOT wait for the VM to exit.
+func (q *QEMU) Attach(_ context.Context, vm *backend.VM) error {
+	bridgeConsole(vm.ConsoleSocket)
+	return nil
+}
+
+// WaitExit blocks until the guest workload sends an exit code on the
+// control channel. The VM itself may still be running after this returns.
+func (q *QEMU) WaitExit(ctx context.Context, vm *backend.VM) (int, error) {
 	q.mu.Lock()
 	rvm, ok := q.running[vm.ID]
 	q.mu.Unlock()
@@ -119,46 +126,11 @@ func (q *QEMU) Attach(ctx context.Context, vm *backend.VM, cfg *backend.VMConfig
 		return 1, fmt.Errorf("vm %s is not running in this process", vm.ID)
 	}
 
-	// Forward signals to QEMU
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-
-	go func() {
-		select {
-		case sig := <-sigCh:
-			rvm.cmd.Process.Signal(sig)
-		case <-ctx.Done():
-			rvm.cmd.Process.Signal(syscall.SIGTERM)
-		}
-	}()
-
-	// Connect to console socket and bridge to terminal
-	consoleDone := make(chan struct{})
-	go func() {
-		defer close(consoleDone)
-		bridgeConsole(vm.ConsoleSocket)
-	}()
-
-	// Wait for QEMU to finish
-	rvm.cmd.Wait()
-
-	// Give console goroutine a moment to flush
-	select {
-	case <-consoleDone:
-	case <-time.After(500 * time.Millisecond):
-	}
-
-	q.mu.Lock()
-	delete(q.running, vm.ID)
-	q.mu.Unlock()
-
-	// Use control channel exit code if available, otherwise 1
 	select {
 	case code := <-rvm.exitCh:
 		return code, nil
-	default:
-		return 1, nil
+	case <-ctx.Done():
+		return 1, ctx.Err()
 	}
 }
 

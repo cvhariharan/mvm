@@ -105,16 +105,41 @@ func run() error {
 		Services: svcManager.RunningNames(),
 	})})
 
+	// Run initial workload
 	exitCode := 0
 	if mvmCmd != "" {
 		exitCode = runWorkload(mvmCmd, mvmEnv, mvmUID)
-	} else if _, ok := ctrl.(nopRWC); ok {
-		exitCode = runWorkload("/bin/sh", mvmEnv, mvmUID)
 	} else {
-		exitCode = waitForExec(ctrl, mvmEnv, mvmUID)
+		exitCode = runWorkload("/bin/sh", mvmEnv, mvmUID)
+	}
+	sendMsg(ctrl, proto.Message{Type: proto.TypeExit, Payload: mustJSON(proto.ExitPayload{Code: exitCode})})
+
+	// Keep the VM alive after the initial workload exits.
+	if _, ok := ctrl.(nopRWC); ok {
+		// No ctrl channel — respawn a shell each time it exits.
+		// The VM stays alive until QEMU is killed externally (mvm stop).
+		for {
+			runWorkload("/bin/sh", mvmEnv, mvmUID)
+		}
 	}
 
-	sendMsg(ctrl, proto.Message{Type: proto.TypeExit, Payload: mustJSON(proto.ExitPayload{Code: exitCode})})
+	// With a working ctrl channel, wait for exec commands from the host.
+	// The VM shuts down when the ctrl channel closes (host disconnects).
+	for {
+		var msg proto.Message
+		if err := json.NewDecoder(ctrl).Decode(&msg); err != nil {
+			break // ctrl channel closed — shut down
+		}
+		if msg.Type == proto.TypeExec {
+			var p proto.ExecPayload
+			json.Unmarshal(msg.Payload, &p)
+			for k, v := range p.Env {
+				mvmEnv[k] = v
+			}
+			code := runWorkload(p.Cmd, mvmEnv, mvmUID)
+			sendMsg(ctrl, proto.Message{Type: proto.TypeExit, Payload: mustJSON(proto.ExitPayload{Code: code})})
+		}
+	}
 
 	svcManager.StopAll(5 * time.Second)
 
@@ -588,11 +613,18 @@ func mountExtra(mounts []extraMount, prefix string) {
 }
 
 func openCtrl() io.ReadWriteCloser {
-	f, err := os.OpenFile(ctrlDevPath, os.O_RDWR, 0)
-	if err != nil {
-		return nopRWC{}
+	// Wait for the virtio-serial device to appear — the driver may not
+	// have initialised yet when mvm-init reaches this point.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		f, err := os.OpenFile(ctrlDevPath, os.O_RDWR, 0)
+		if err == nil {
+			return f
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	return f
+	fmt.Fprintf(os.Stderr, "mvm-init: ctrl device %s not available, running without control channel\n", ctrlDevPath)
+	return nopRWC{}
 }
 
 type nopRWC struct{}

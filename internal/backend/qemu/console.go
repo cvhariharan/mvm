@@ -1,6 +1,7 @@
 package qemu
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -11,7 +12,8 @@ import (
 
 // bridgeConsole connects to the VM's serial console unix socket and
 // bridges it to the host terminal (stdin/stdout) with raw mode.
-// Blocks until the socket closes or an error occurs.
+// The user can detach with Ctrl+] without stopping the VM.
+// Blocks until the user detaches or the socket closes.
 func bridgeConsole(socketPath string) {
 	// Wait for console socket to appear
 	var conn net.Conn
@@ -36,7 +38,8 @@ func bridgeConsole(socketPath string) {
 		defer term.Restore(fd, oldState)
 	}
 
-	// Bidirectional copy: terminal <-> socket
+	fmt.Fprintf(os.Stdout, "Connected to VM console. Press Ctrl+] to detach.\r\n")
+
 	done := make(chan struct{}, 2)
 
 	// socket -> stdout
@@ -45,19 +48,18 @@ func bridgeConsole(socketPath string) {
 		done <- struct{}{}
 	}()
 
-	// stdin -> socket
+	// stdin -> socket (with Ctrl+] escape detection)
 	go func() {
-		io.Copy(conn, os.Stdin)
+		copyUntilEscape(conn, os.Stdin)
 		done <- struct{}{}
 	}()
 
-	// Wait for either direction to close
 	<-done
 }
 
 // AttachConsole connects to an already-running VM's console socket.
 // Used by `mvm attach` for VMs started by a different CLI invocation.
-// Blocks until the socket closes or an error occurs.
+// Blocks until the user detaches or the socket closes.
 func AttachConsole(socketPath string) error {
 	conn, err := net.Dial("unix", socketPath)
 	if err != nil {
@@ -71,6 +73,8 @@ func AttachConsole(socketPath string) error {
 		defer term.Restore(fd, oldState)
 	}
 
+	fmt.Fprintf(os.Stdout, "Connected to VM console. Press Ctrl+] to detach.\r\n")
+
 	done := make(chan struct{}, 2)
 
 	go func() {
@@ -79,10 +83,33 @@ func AttachConsole(socketPath string) error {
 	}()
 
 	go func() {
-		io.Copy(conn, os.Stdin)
+		copyUntilEscape(conn, os.Stdin)
 		done <- struct{}{}
 	}()
 
 	<-done
 	return nil
+}
+
+// copyUntilEscape copies from src to dst, returning when Ctrl+] (0x1d) is
+// pressed or the source closes.
+func copyUntilEscape(dst io.Writer, src io.Reader) error {
+	buf := make([]byte, 256)
+	for {
+		n, err := src.Read(buf)
+		for i := 0; i < n; i++ {
+			if buf[i] == 0x1d { // Ctrl+]
+				if i > 0 {
+					dst.Write(buf[:i])
+				}
+				return nil
+			}
+		}
+		if n > 0 {
+			dst.Write(buf[:n])
+		}
+		if err != nil {
+			return err
+		}
+	}
 }

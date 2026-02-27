@@ -140,7 +140,9 @@ func (m *Manager) Create(ctx context.Context, opts CreateOpts) (*state.VMState, 
 	return vmState, nil
 }
 
-// Start launches a created or stopped VM. If foreground is true, blocks until exit.
+// Start launches a created or stopped VM.
+// If foreground is true, attaches to the console and returns when the user
+// detaches (Ctrl+D). The VM keeps running in the background.
 func (m *Manager) Start(ctx context.Context, id string, foreground bool) (int, error) {
 	vmState, err := m.store.Lookup(id)
 	if err != nil {
@@ -169,18 +171,9 @@ func (m *Manager) Start(ctx context.Context, id string, foreground bool) (int, e
 		return 0, nil
 	}
 
-	// Block until exit
-	exitCode, err := m.backend.Attach(ctx, vm, vmCfg)
-
-	vmState.Status = state.StatusStopped
-	vmState.StoppedAt = time.Now()
-	vmState.Pid = 0
-	m.store.Save(vmState)
-
-	if err != nil {
-		return 1, fmt.Errorf("attach vm: %w", err)
-	}
-	return exitCode, nil
+	// Attach to console — returns when user detaches, VM keeps running
+	m.backend.Attach(ctx, vm)
+	return 0, nil
 }
 
 // Stop sends SIGTERM to a running VM, waiting up to 10s before SIGKILL.
@@ -248,23 +241,41 @@ func (m *Manager) List() ([]*state.VMState, error) {
 	return m.store.List()
 }
 
-// Run is the ephemeral shortcut: create + start(foreground) + remove.
+// Run is the ephemeral shortcut: create, start, attach console, wait for
+// the command to finish, stop the VM, and clean up.
 func (m *Manager) Run(ctx context.Context, command string) (int, error) {
 	vmState, err := m.Create(ctx, CreateOpts{Command: command})
 	if err != nil {
 		return 1, err
 	}
 
-	exitCode, runErr := m.Start(ctx, vmState.ID, true)
+	vmCfg := stateToVMConfig(vmState)
+	vm := stateToVM(vmState)
 
-	// Always clean up in ephemeral mode
+	if err := m.backend.Start(ctx, vm, vmCfg); err != nil {
+		m.Remove(ctx, vmState.ID, true)
+		return 1, fmt.Errorf("start vm: %w", err)
+	}
+
+	vmState.Status = state.StatusRunning
+	vmState.Pid = vm.Pid
+	vmState.StartedAt = time.Now()
+	m.store.Save(vmState)
+
+	// Bridge console in a goroutine — will close when QEMU exits
+	go m.backend.Attach(ctx, vm)
+
+	// Wait for the guest command to finish (exit code from ctrl channel)
+	exitCode, _ := m.backend.WaitExit(ctx, vm)
+
+	// Stop the VM (mvm-init stays alive after workload, so we kill QEMU)
+	m.backend.Stop(ctx, vm)
+
+	// Clean up
 	if err := m.Remove(ctx, vmState.ID, true); err != nil {
 		fmt.Fprintf(os.Stderr, "cleanup: %v\n", err)
 	}
 
-	if runErr != nil {
-		return 1, runErr
-	}
 	return exitCode, nil
 }
 
