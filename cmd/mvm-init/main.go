@@ -4,6 +4,7 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/cvhariharan/mvm/internal/proto"
 )
@@ -414,8 +416,66 @@ func bootFromInitrd(rootDev, mvmWS string) error {
 }
 
 func setupNetworking() {
-	exec.Command("ip", "link", "set", "lo", "up").Run()
-	exec.Command("ip", "link", "set", "eth0", "up").Run()
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "network setup: %v\n", err)
+		return
+	}
+	defer syscall.Close(fd)
+
+	ifUp(fd, "lo")
+	ifUp(fd, "eth0")
+	ifAddr(fd, "eth0", [4]byte{10, 0, 2, 15}, [4]byte{255, 255, 255, 0})
+	addDefaultRoute([4]byte{10, 0, 2, 2})
+}
+
+func ifUp(fd int, name string) {
+	var req [40]byte
+	copy(req[:16], name)
+	syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), syscall.SIOCGIFFLAGS, uintptr(unsafe.Pointer(&req[0])))
+	flags := binary.LittleEndian.Uint16(req[16:18])
+	flags |= syscall.IFF_UP | syscall.IFF_RUNNING
+	binary.LittleEndian.PutUint16(req[16:18], flags)
+	syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), syscall.SIOCSIFFLAGS, uintptr(unsafe.Pointer(&req[0])))
+}
+
+func ifAddr(fd int, name string, ip, mask [4]byte) {
+	var req [40]byte
+	copy(req[:16], name)
+	// sockaddr_in: family(2) + port(2) + addr(4) + zero(8)
+	binary.LittleEndian.PutUint16(req[16:18], syscall.AF_INET)
+	copy(req[20:24], ip[:])
+	syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), syscall.SIOCSIFADDR, uintptr(unsafe.Pointer(&req[0])))
+	copy(req[20:24], mask[:])
+	syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), syscall.SIOCSIFNETMASK, uintptr(unsafe.Pointer(&req[0])))
+}
+
+func addDefaultRoute(gw [4]byte) {
+	fd, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_RAW, syscall.NETLINK_ROUTE)
+	if err != nil {
+		return
+	}
+	defer syscall.Close(fd)
+	syscall.Bind(fd, &syscall.SockaddrNetlink{Family: syscall.AF_NETLINK})
+
+	// nlmsghdr(16) + rtmsg(12) + RTA_GATEWAY(8) = 36 bytes
+	var buf [36]byte
+	binary.LittleEndian.PutUint32(buf[0:], 36)
+	binary.LittleEndian.PutUint16(buf[4:], syscall.RTM_NEWROUTE)
+	binary.LittleEndian.PutUint16(buf[6:], syscall.NLM_F_REQUEST|syscall.NLM_F_CREATE|syscall.NLM_F_EXCL)
+	binary.LittleEndian.PutUint32(buf[8:], 1)
+	// rtmsg at offset 16
+	buf[16] = syscall.AF_INET
+	buf[20] = syscall.RT_TABLE_MAIN
+	buf[21] = syscall.RTPROT_BOOT
+	buf[22] = syscall.RT_SCOPE_UNIVERSE
+	buf[23] = syscall.RTN_UNICAST
+	// RTA_GATEWAY at offset 28
+	binary.LittleEndian.PutUint16(buf[28:], 8)
+	binary.LittleEndian.PutUint16(buf[30:], syscall.RTA_GATEWAY)
+	copy(buf[32:], gw[:])
+
+	syscall.Sendto(fd, buf[:], 0, &syscall.SockaddrNetlink{Family: syscall.AF_NETLINK})
 }
 
 func parseCmdline(raw string) map[string]string {
