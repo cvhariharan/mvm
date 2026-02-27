@@ -394,16 +394,20 @@ func bootFromInitrd(rootDev, mvmWS string) error {
 		os.MkdirAll(filepath.Join(newRoot, dir), 0755)
 	}
 
-	putOld := filepath.Join(newRoot, ".initrd")
-	os.MkdirAll(putOld, 0755)
-
-	if err := syscall.PivotRoot(newRoot, putOld); err != nil {
-		return fmt.Errorf("pivot_root: %w", err)
+	// switch_root: pivot_root doesn't work from initramfs (rootfs),
+	// so use the MS_MOVE + chroot pattern instead.
+	if err := syscall.Chdir(newRoot); err != nil {
+		return fmt.Errorf("chdir newroot: %w", err)
 	}
-	os.Chdir("/")
-
-	syscall.Unmount("/.initrd", syscall.MNT_DETACH)
-	os.Remove("/.initrd")
+	if err := syscall.Mount(newRoot, "/", "", syscall.MS_MOVE, ""); err != nil {
+		return fmt.Errorf("mount move: %w", err)
+	}
+	if err := syscall.Chroot("."); err != nil {
+		return fmt.Errorf("chroot: %w", err)
+	}
+	if err := syscall.Chdir("/"); err != nil {
+		return fmt.Errorf("chdir /: %w", err)
+	}
 
 	mountEssential()
 	return nil

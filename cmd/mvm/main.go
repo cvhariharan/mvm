@@ -6,12 +6,17 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/cvhariharan/mvm/internal/backend/qemu"
 	"github.com/cvhariharan/mvm/internal/config"
 	"github.com/cvhariharan/mvm/internal/kernel"
-	"github.com/cvhariharan/mvm/internal/microvm"
-	"github.com/cvhariharan/mvm/internal/microvm/qemu"
-	"github.com/cvhariharan/mvm/internal/rootfs"
+	"github.com/cvhariharan/mvm/internal/vm"
 	"github.com/spf13/cobra"
+)
+
+var (
+	flagImage  string
+	flagMemory string
+	flagCPUs   int
 )
 
 func main() {
@@ -21,17 +26,34 @@ func main() {
 }
 
 var rootCmd = &cobra.Command{
-	Use:   "mvm [image]",
+	Use:   "mvm",
 	Short: "MicroVM development sandbox tool",
 	Long:  "A simple tool to create microvms for development sandboxes",
-	Args:  cobra.MaximumNArgs(1),
-	RunE:  runVM,
+}
+
+var runCmd = &cobra.Command{
+	Use:   "run [flags] -- <command> [args...]",
+	Short: "Run a command in a microVM",
+	Args:  cobra.ArbitraryArgs,
+	RunE:  runRun,
+}
+
+var shellCmd = &cobra.Command{
+	Use:   "shell",
+	Short: "Start an interactive shell in a microVM",
+	RunE:  runShell,
 }
 
 var initCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Create a .mvm config file",
 	RunE:  runInit,
+}
+
+var buildCmd = &cobra.Command{
+	Use:   "build",
+	Short: "Pre-cache kernel and rootfs without running a VM",
+	RunE:  runBuild,
 }
 
 var kernelCmd = &cobra.Command{
@@ -53,92 +75,98 @@ var kernelListCmd = &cobra.Command{
 }
 
 func init() {
+	for _, cmd := range []*cobra.Command{runCmd, shellCmd, buildCmd} {
+		cmd.Flags().StringVar(&flagImage, "image", "", "container image")
+		cmd.Flags().StringVar(&flagMemory, "memory", "", "memory size (e.g. 512M)")
+		cmd.Flags().IntVar(&flagCPUs, "cpus", 0, "number of CPUs")
+	}
+
+	rootCmd.AddCommand(runCmd)
+	rootCmd.AddCommand(shellCmd)
 	rootCmd.AddCommand(initCmd)
+	rootCmd.AddCommand(buildCmd)
 	rootCmd.AddCommand(kernelCmd)
 	kernelCmd.AddCommand(kernelPullCmd)
 	kernelCmd.AddCommand(kernelListCmd)
 }
 
-func runVM(cmd *cobra.Command, args []string) error {
-	ctx := context.Background()
-
-	// Get working directory
+func loadConfig() (*config.Config, string, error) {
 	workDir, err := os.Getwd()
+	if err != nil {
+		return nil, "", err
+	}
+
+	cfg, err := config.Load(workDir)
+	if err != nil {
+		return nil, "", fmt.Errorf("load config: %w", err)
+	}
+
+	// Apply CLI flag overrides
+	if flagImage != "" {
+		cfg.VM.Image = flagImage
+	}
+	if flagMemory != "" {
+		cfg.VM.Memory = flagMemory
+	}
+	if flagCPUs > 0 {
+		cfg.VM.CPUs = flagCPUs
+	}
+
+	return cfg, workDir, nil
+}
+
+func createManager(cfg *config.Config, workDir string) (*vm.Manager, error) {
+	b := qemu.New()
+	if err := b.Available(); err != nil {
+		return nil, fmt.Errorf("backend not available: %w", err)
+	}
+	return vm.NewManager(b, cfg, workDir), nil
+}
+
+func runRun(cmd *cobra.Command, args []string) error {
+	cfg, workDir, err := loadConfig()
 	if err != nil {
 		return err
 	}
 
-	// Load config
-	cfg, err := config.Load(workDir)
-	if err != nil {
-		return fmt.Errorf("failed to load config: %w", err)
-	}
-
-	// Override image if provided as argument
+	command := "/bin/sh"
 	if len(args) > 0 {
-		cfg.Image = args[0]
-	}
-
-	fmt.Printf("Image: %s\n", cfg.Image)
-	fmt.Printf("Kernel: %s\n", cfg.Kernel)
-
-	// Pull kernel
-	puller, err := kernel.NewPuller()
-	if err != nil {
-		return fmt.Errorf("failed to create kernel puller: %w", err)
-	}
-
-	kernelPath, err := puller.Get(cfg.Kernel)
-	if err != nil {
-		return fmt.Errorf("failed to get kernel: %w", err)
-	}
-	fmt.Printf("Kernel path: %s\n", kernelPath)
-
-	// Build mounts list - always include working directory
-	mounts := []microvm.Mount{
-		{Host: workDir, Guest: "/workspace"},
-	}
-	for _, m := range cfg.Mounts {
-		hostPath := m.Host
-		if !filepath.IsAbs(hostPath) {
-			hostPath = filepath.Join(workDir, hostPath)
+		command = args[0]
+		for _, a := range args[1:] {
+			command += " " + a
 		}
-		mounts = append(mounts, microvm.Mount{Host: hostPath, Guest: m.Guest})
 	}
 
-	initBinary := filepath.Join(workDir, "bin", "mvm-init")
-
-	fmt.Println("Building rootfs...")
-	builder, err := rootfs.NewBuilder(initBinary)
+	mgr, err := createManager(cfg, workDir)
 	if err != nil {
-		return fmt.Errorf("failed to create rootfs builder: %w", err)
+		return err
 	}
-	defer builder.Cleanup()
 
-	rootfsPath, err := builder.Build(ctx, cfg.Image, mounts, cfg.StartScript)
+	exitCode, err := mgr.Run(context.Background(), command)
 	if err != nil {
-		return fmt.Errorf("failed to build rootfs: %w", err)
+		return err
 	}
-	fmt.Printf("Rootfs path: %s\n", rootfsPath)
+	os.Exit(exitCode)
+	return nil
+}
 
-	// Build port forwards
-	var ports []microvm.PortForward
-	for _, p := range cfg.Ports {
-		ports = append(ports, microvm.PortForward{Host: p.Host, Guest: p.Guest})
+func runShell(cmd *cobra.Command, args []string) error {
+	cfg, workDir, err := loadConfig()
+	if err != nil {
+		return err
 	}
 
-	// Run VM
-	fmt.Println("Starting microvm...")
-	vm := qemu.New()
-	return vm.Run(ctx, &microvm.Config{
-		Kernel:      kernelPath,
-		Rootfs:      rootfsPath,
-		Memory:      cfg.Memory,
-		CPUs:        cfg.CPUs,
-		Mounts:      mounts,
-		Ports:       ports,
-		StartScript: cfg.StartScript,
-	})
+	mgr, err := createManager(cfg, workDir)
+	if err != nil {
+		return err
+	}
+
+	exitCode, err := mgr.Run(context.Background(), "/bin/sh")
+	if err != nil {
+		return err
+	}
+	os.Exit(exitCode)
+	return nil
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
@@ -152,13 +180,26 @@ func runInit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf(".mvm already exists")
 	}
 
-	cfg := config.Default()
-	if err := config.Save(workDir, cfg); err != nil {
+	if err := config.Save(workDir); err != nil {
 		return fmt.Errorf("failed to create .mvm: %w", err)
 	}
 
 	fmt.Println("Created .mvm config file")
 	return nil
+}
+
+func runBuild(cmd *cobra.Command, args []string) error {
+	cfg, workDir, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	mgr, err := createManager(cfg, workDir)
+	if err != nil {
+		return err
+	}
+
+	return mgr.Build(context.Background())
 }
 
 func runKernelPull(cmd *cobra.Command, args []string) error {

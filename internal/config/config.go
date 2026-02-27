@@ -4,93 +4,118 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/BurntSushi/toml"
+	"github.com/knadh/koanf/parsers/toml"
+	"github.com/knadh/koanf/providers/confmap"
+	"github.com/knadh/koanf/providers/file"
+	"github.com/knadh/koanf/v2"
 )
 
 const (
-	DefaultKernel = "ghcr.io/mvm/kernel:latest"
-	DefaultImage  = "alpine:latest"
-	DefaultMemory = "512M"
-	DefaultCPUs   = 2
-	ConfigFile    = ".mvm"
+	DefaultKernel  = "ghcr.io/mvm/kernel:latest"
+	DefaultImage   = "alpine:latest"
+	DefaultMemory  = "512M"
+	DefaultCPUs    = 2
+	DefaultBackend = "qemu"
+	DefaultDNS     = "10.0.2.3"
+	DefaultNetMode = "slirp"
+	DefaultWSGuest = "/workspace"
+	ConfigFile     = ".mvm"
 )
 
-// Mount represents a host to guest directory mapping.
-type Mount struct {
-	Host  string `toml:"host"`
-	Guest string `toml:"guest"`
-}
-
-// Port represents a host to guest port mapping.
-type Port struct {
-	Host  int `toml:"host"`
-	Guest int `toml:"guest"`
-}
-
-// Config represents the .mvm configuration file.
 type Config struct {
-	Image       string  `toml:"image"`
-	Kernel      string  `toml:"kernel"`
-	Memory      string  `toml:"memory"`
-	CPUs        int     `toml:"cpus"`
-	Mounts      []Mount `toml:"mounts"`
-	Ports       []Port  `toml:"ports"`
-	StartScript string  `toml:"start_script"`
+	VM      VMConfig          `koanf:"vm"`
+	Network NetworkConfig     `koanf:"network"`
+	Mounts  MountConfig       `koanf:"mounts"`
+	Cache   CacheConfig       `koanf:"cache"`
+	Env     map[string]string `koanf:"env"`
 }
 
-// Default returns a Config with default values.
-func Default() *Config {
-	return &Config{
-		Image:  DefaultImage,
-		Kernel: DefaultKernel,
-		Memory: DefaultMemory,
-		CPUs:   DefaultCPUs,
+type VMConfig struct {
+	Image   string `koanf:"image"`
+	Kernel  string `koanf:"kernel"`
+	Memory  string `koanf:"memory"`
+	CPUs    int    `koanf:"cpus"`
+	Backend string `koanf:"backend"`
+}
+
+type NetworkConfig struct {
+	Mode string `koanf:"mode"`
+	DNS  string `koanf:"dns"`
+}
+
+type MountConfig struct {
+	Workspace   string            `koanf:"workspace"`
+	ExtraMounts map[string]string `koanf:"extra"`
+}
+
+type CacheConfig struct {
+	Dir string `koanf:"dir"`
+}
+
+var defaults = map[string]interface{}{
+	"vm.image":        DefaultImage,
+	"vm.kernel":       DefaultKernel,
+	"vm.memory":       DefaultMemory,
+	"vm.cpus":         DefaultCPUs,
+	"vm.backend":      DefaultBackend,
+	"network.mode":    DefaultNetMode,
+	"network.dns":     DefaultDNS,
+	"mounts.workspace": DefaultWSGuest,
+}
+
+// Load reads config with layered merging: defaults → global → project.
+func Load(projectDir string) (*Config, error) {
+	k := koanf.New(".")
+	parser := toml.Parser()
+
+	// Layer 1: hardcoded defaults
+	if err := k.Load(confmap.Provider(defaults, "."), nil); err != nil {
+		return nil, err
 	}
-}
 
-// Load reads the .mvm config file from the given directory.
-// Returns default config if the file doesn't exist.
-func Load(dir string) (*Config, error) {
-	cfg := Default()
-	path := filepath.Join(dir, ConfigFile)
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return cfg, nil
+	// Layer 2: global config ~/.config/mvm/config.toml
+	if home, err := os.UserHomeDir(); err == nil {
+		globalPath := filepath.Join(home, ".config", "mvm", "config.toml")
+		if _, err := os.Stat(globalPath); err == nil {
+			if err := k.Load(file.Provider(globalPath), parser); err != nil {
+				return nil, err
+			}
 		}
+	}
+
+	// Layer 3: per-project .mvm
+	projectPath := filepath.Join(projectDir, ConfigFile)
+	if _, err := os.Stat(projectPath); err == nil {
+		if err := k.Load(file.Provider(projectPath), parser); err != nil {
+			return nil, err
+		}
+	}
+
+	var cfg Config
+	if err := k.Unmarshal("", &cfg); err != nil {
 		return nil, err
 	}
 
-	if err := toml.Unmarshal(data, cfg); err != nil {
-		return nil, err
-	}
-
-	// Apply defaults for empty values
-	if cfg.Image == "" {
-		cfg.Image = DefaultImage
-	}
-	if cfg.Kernel == "" {
-		cfg.Kernel = DefaultKernel
-	}
-	if cfg.Memory == "" {
-		cfg.Memory = DefaultMemory
-	}
-	if cfg.CPUs == 0 {
-		cfg.CPUs = DefaultCPUs
-	}
-
-	return cfg, nil
+	return &cfg, nil
 }
 
-// Save writes the config to the .mvm file in the given directory.
-func Save(dir string, cfg *Config) error {
+// Save writes a default .mvm config file to the given directory.
+func Save(dir string) error {
 	path := filepath.Join(dir, ConfigFile)
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
+	content := `[vm]
+image = "alpine:latest"
+kernel = "ghcr.io/mvm/kernel:latest"
+memory = "512M"
+cpus = 2
 
-	return toml.NewEncoder(f).Encode(cfg)
+[network]
+mode = "slirp"
+
+[mounts]
+workspace = "/workspace"
+
+[env]
+# KEY = "value"
+`
+	return os.WriteFile(path, []byte(content), 0644)
 }
