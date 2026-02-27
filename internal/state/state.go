@@ -44,9 +44,17 @@ type VMState struct {
 	CPUs      int               `json:"cpus"`
 	Network   NetworkState      `json:"network"`
 	Workspace WorkspaceState    `json:"workspace"`
-	Env       map[string]string `json:"env,omitempty"`
-	Command   string            `json:"command,omitempty"`
-	UID       string            `json:"uid"`
+	ExtraMounts []MountState      `json:"extra_mounts,omitempty"`
+	Env         map[string]string `json:"env,omitempty"`
+	Command     string            `json:"command,omitempty"`
+	UID         string            `json:"uid"`
+}
+
+// MountState describes a persisted host→guest 9p mount.
+type MountState struct {
+	Tag      string `json:"tag"`
+	HostDir  string `json:"host_dir"`
+	GuestDir string `json:"guest_dir"`
 }
 
 type NetworkState struct {

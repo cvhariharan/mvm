@@ -114,6 +114,18 @@ func (m *Manager) Create(ctx context.Context, opts CreateOpts) (*state.VMState, 
 		Env: m.cfg.Env,
 	}
 
+	// Resolve extra mounts from config
+	i := 0
+	for hostPath, guestPath := range m.cfg.Mounts.ExtraMounts {
+		tag := fmt.Sprintf("mnt%d", i)
+		vmState.ExtraMounts = append(vmState.ExtraMounts, state.MountState{
+			Tag:      tag,
+			HostDir:  hostPath,
+			GuestDir: guestPath,
+		})
+		i++
+	}
+
 	// Create the qcow2 overlay via the backend
 	vmCfg := stateToVMConfig(vmState)
 	_, err = m.backend.Create(ctx, vmCfg)
@@ -285,14 +297,22 @@ func (m *Manager) Build(ctx context.Context) error {
 
 // stateToVMConfig converts persisted state back to the backend VMConfig.
 func stateToVMConfig(s *state.VMState) *backend.VMConfig {
+	var mounts []backend.Mount
+	for _, m := range s.ExtraMounts {
+		mounts = append(mounts, backend.Mount{
+			Tag:      m.Tag,
+			HostDir:  m.HostDir,
+			GuestDir: m.GuestDir,
+		})
+	}
 	return &backend.VMConfig{
-		ID:         s.ID,
-		Kernel:     s.KernelPath,
-		Initrd:     s.InitrdPath,
-		Rootfs:     s.RootfsPath,
-		OverlayDir: s.OverlayPath[:len(s.OverlayPath)-len("/"+s.ID+".qcow2")],
-		Memory:     s.Memory,
-		CPUs:       s.CPUs,
+		ID:          s.ID,
+		Kernel:      s.KernelPath,
+		Initrd:      s.InitrdPath,
+		Rootfs:      s.RootfsPath,
+		OverlayDir:  s.OverlayPath[:len(s.OverlayPath)-len("/"+s.ID+".qcow2")],
+		Memory:      s.Memory,
+		CPUs:        s.CPUs,
 		Network: backend.NetworkConfig{
 			Mode: s.Network.Mode,
 			DNS:  s.Network.DNS,
@@ -301,9 +321,10 @@ func stateToVMConfig(s *state.VMState) *backend.VMConfig {
 			HostDir:  s.Workspace.HostDir,
 			GuestDir: s.Workspace.GuestDir,
 		},
-		Env:     s.Env,
-		Command: s.Command,
-		UID:     s.UID,
+		ExtraMounts: mounts,
+		Env:         s.Env,
+		Command:     s.Command,
+		UID:         s.UID,
 	}
 }
 

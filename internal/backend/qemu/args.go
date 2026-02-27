@@ -56,6 +56,14 @@ func buildArgs(cfg *backend.VMConfig, vm *backend.VM) []string {
 		)
 	}
 
+	// Extra 9p mounts
+	for _, m := range cfg.ExtraMounts {
+		args = append(args,
+			"-fsdev", fmt.Sprintf("local,id=%s,path=%s,security_model=none", m.Tag, m.HostDir),
+			"-device", fmt.Sprintf("virtio-9p-device,fsdev=%s,mount_tag=%s", m.Tag, m.Tag),
+		)
+	}
+
 	// Kernel command line
 	args = append(args, "-append", buildCmdline(cfg))
 
@@ -83,6 +91,9 @@ func buildCmdline(cfg *backend.VMConfig) string {
 	if len(cfg.Env) > 0 {
 		parts = append(parts, "mvm.env="+encodeEnv(cfg.Env))
 	}
+	if len(cfg.ExtraMounts) > 0 {
+		parts = append(parts, "mvm.mounts="+encodeMounts(cfg.ExtraMounts))
+	}
 
 	return strings.Join(parts, " ")
 }
@@ -91,6 +102,15 @@ func encodeEnv(env map[string]string) string {
 	var lines []string
 	for k, v := range env {
 		lines = append(lines, k+"="+v)
+	}
+	return base64.StdEncoding.EncodeToString([]byte(strings.Join(lines, "\n")))
+}
+
+// encodeMounts encodes extra mounts as base64("tag:guestpath\ntag:guestpath\n...")
+func encodeMounts(mounts []backend.Mount) string {
+	var lines []string
+	for _, m := range mounts {
+		lines = append(lines, m.Tag+":"+m.GuestDir)
 	}
 	return base64.StdEncoding.EncodeToString([]byte(strings.Join(lines, "\n")))
 }

@@ -68,13 +68,14 @@ func run() error {
 	mvmUID := params["mvm.uid"]
 	mvmWS := params["mvm.ws"]
 	mvmEnv := decodeEnv(params["mvm.env"])
+	mvmMounts := decodeMounts(params["mvm.mounts"])
 
 	if isInitrd() {
 		rootDev := params["root"]
 		if rootDev == "" {
 			return fmt.Errorf("no root= on kernel cmdline")
 		}
-		if err := bootFromInitrd(rootDev, mvmWS); err != nil {
+		if err := bootFromInitrd(rootDev, mvmWS, mvmMounts); err != nil {
 			return err
 		}
 	} else {
@@ -86,6 +87,7 @@ func run() error {
 				fmt.Fprintf(os.Stderr, "mount workspace: %v\n", err)
 			}
 		}
+		mountExtra(mvmMounts, "")
 		writeFile("/etc/resolv.conf", "nameserver 10.0.2.3\n", 0644)
 		writeFile("/etc/hosts", "127.0.0.1 localhost\n::1 localhost\n", 0644)
 	}
@@ -367,7 +369,7 @@ func mountEssential() {
 	}
 }
 
-func bootFromInitrd(rootDev, mvmWS string) error {
+func bootFromInitrd(rootDev, mvmWS string, extraMounts []extraMount) error {
 	if err := waitForDevice(rootDev, 10*time.Second); err != nil {
 		return fmt.Errorf("waiting for %s: %w", rootDev, err)
 	}
@@ -386,6 +388,8 @@ func bootFromInitrd(rootDev, mvmWS string) error {
 			fmt.Fprintf(os.Stderr, "mount workspace: %v\n", err)
 		}
 	}
+
+	mountExtra(extraMounts, newRoot)
 
 	writeFile(filepath.Join(newRoot, "etc/resolv.conf"),
 		"nameserver 10.0.2.3\n", 0644)
@@ -541,6 +545,46 @@ func decodeEnv(encoded string) map[string]string {
 		}
 	}
 	return env
+}
+
+type extraMount struct {
+	Tag      string
+	GuestDir string
+}
+
+func decodeMounts(encoded string) []extraMount {
+	if encoded == "" {
+		return nil
+	}
+	b, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil
+	}
+	var mounts []extraMount
+	for _, line := range strings.Split(string(b), "\n") {
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) == 2 {
+			mounts = append(mounts, extraMount{Tag: parts[0], GuestDir: parts[1]})
+		}
+	}
+	return mounts
+}
+
+// mountExtra mounts all extra 9p filesystems. If prefix is non-empty,
+// guest paths are joined under it (used during initrd boot before chroot).
+func mountExtra(mounts []extraMount, prefix string) {
+	for _, m := range mounts {
+		target := m.GuestDir
+		if prefix != "" {
+			target = filepath.Join(prefix, m.GuestDir)
+		}
+		os.MkdirAll(target, 0755)
+		if err := syscall.Mount(m.Tag, target, "9p",
+			syscall.MS_NOATIME,
+			"trans=virtio,version=9p2000.L,msize=104857600"); err != nil {
+			fmt.Fprintf(os.Stderr, "mount %s at %s: %v\n", m.Tag, target, err)
+		}
+	}
 }
 
 func openCtrl() io.ReadWriteCloser {

@@ -4,19 +4,27 @@ import "context"
 
 // VMConfig holds all parameters needed to create and run a VM.
 type VMConfig struct {
-	ID         string
-	Kernel     string
-	Initrd     string
-	Rootfs     string
-	OverlayDir string
-	Memory     string
-	CPUs       int
-	Network    NetworkConfig
-	Workspace  WorkspaceConfig
-	Env        map[string]string
-	Command    string
-	UID        string
-	CtrlSocket string
+	ID          string
+	Kernel      string
+	Initrd      string
+	Rootfs      string
+	OverlayDir  string
+	Memory      string
+	CPUs        int
+	Network     NetworkConfig
+	Workspace   WorkspaceConfig
+	ExtraMounts []Mount // additional 9p mounts
+	Env         map[string]string
+	Command     string
+	UID         string
+	CtrlSocket  string
+}
+
+// Mount describes a host→guest 9p bind mount.
+type Mount struct {
+	Tag      string // unique 9p mount tag (e.g. "mnt0")
+	HostDir  string // absolute path on host
+	GuestDir string // absolute path inside guest
 }
 
 type NetworkConfig struct {
