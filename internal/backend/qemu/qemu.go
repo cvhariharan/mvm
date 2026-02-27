@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -17,10 +18,20 @@ import (
 	"github.com/cvhariharan/mvm/internal/proto"
 )
 
-// QEMU implements the backend.Backend interface.
-type QEMU struct{}
+// runningVM tracks a QEMU process launched by this CLI invocation.
+type runningVM struct {
+	cmd    *exec.Cmd
+	exitCh chan int
+	cancel context.CancelFunc
+}
 
-func New() *QEMU { return &QEMU{} }
+// QEMU implements the backend.Backend interface.
+type QEMU struct {
+	mu      sync.Mutex
+	running map[string]*runningVM
+}
+
+func New() *QEMU { return &QEMU{running: map[string]*runningVM{}} }
 
 func (q *QEMU) Name() string { return "qemu" }
 
@@ -44,6 +55,7 @@ func (q *QEMU) Create(ctx context.Context, cfg *backend.VMConfig) (*backend.VM, 
 
 	overlayImg := filepath.Join(overlayDir, cfg.ID+".qcow2")
 	ctrlSocket := filepath.Join(overlayDir, cfg.ID+".sock")
+	consoleSocket := filepath.Join(overlayDir, cfg.ID+".console.sock")
 
 	// Create qcow2 overlay backed by the rootfs
 	cmd := exec.CommandContext(ctx, "qemu-img", "create",
@@ -57,40 +69,32 @@ func (q *QEMU) Create(ctx context.Context, cfg *backend.VMConfig) (*backend.VM, 
 	}
 
 	return &backend.VM{
-		ID:         cfg.ID,
-		OverlayImg: overlayImg,
-		CtrlSocket: ctrlSocket,
+		ID:            cfg.ID,
+		OverlayImg:    overlayImg,
+		CtrlSocket:    ctrlSocket,
+		ConsoleSocket: consoleSocket,
 	}, nil
 }
 
-func (q *QEMU) Start(ctx context.Context, vm *backend.VM, cfg *backend.VMConfig) (int, error) {
+// Start launches the QEMU process and returns immediately.
+// Sets vm.Pid. Call Attach() to block until exit with console I/O.
+func (q *QEMU) Start(ctx context.Context, vm *backend.VM, cfg *backend.VMConfig) error {
+	// Remove stale sockets from a previous run
+	os.Remove(vm.CtrlSocket)
+	os.Remove(vm.ConsoleSocket)
+
 	args := buildArgs(cfg, vm)
 
-	fmt.Fprintf(os.Stderr, "QEMU args: %v\n", args)
-
-	cmd := exec.CommandContext(ctx, "qemu-system-x86_64", args...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
+	qemuCtx, cancel := context.WithCancel(ctx)
+	cmd := exec.CommandContext(qemuCtx, "qemu-system-x86_64", args...)
+	// No stdin/stdout — console goes through the socket
 	cmd.Stderr = os.Stderr
 
-	// Forward signals to QEMU
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-
 	if err := cmd.Start(); err != nil {
-		return 1, fmt.Errorf("start qemu: %w", err)
+		cancel()
+		return fmt.Errorf("start qemu: %w", err)
 	}
 	vm.Pid = cmd.Process.Pid
-
-	go func() {
-		select {
-		case <-sigCh:
-			cmd.Process.Signal(syscall.SIGTERM)
-		case <-ctx.Done():
-			cmd.Process.Signal(syscall.SIGTERM)
-		}
-	}()
 
 	// Read exit code from control channel in background
 	exitCh := make(chan int, 1)
@@ -98,12 +102,60 @@ func (q *QEMU) Start(ctx context.Context, vm *backend.VM, cfg *backend.VMConfig)
 		exitCh <- q.readCtrl(vm.CtrlSocket)
 	}()
 
+	q.mu.Lock()
+	q.running[vm.ID] = &runningVM{cmd: cmd, exitCh: exitCh, cancel: cancel}
+	q.mu.Unlock()
+
+	return nil
+}
+
+// Attach connects to the VM's serial console socket, bridges it to the
+// terminal, and blocks until the VM exits. Returns the guest exit code.
+func (q *QEMU) Attach(ctx context.Context, vm *backend.VM, cfg *backend.VMConfig) (int, error) {
+	q.mu.Lock()
+	rvm, ok := q.running[vm.ID]
+	q.mu.Unlock()
+	if !ok {
+		return 1, fmt.Errorf("vm %s is not running in this process", vm.ID)
+	}
+
+	// Forward signals to QEMU
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	go func() {
+		select {
+		case sig := <-sigCh:
+			rvm.cmd.Process.Signal(sig)
+		case <-ctx.Done():
+			rvm.cmd.Process.Signal(syscall.SIGTERM)
+		}
+	}()
+
+	// Connect to console socket and bridge to terminal
+	consoleDone := make(chan struct{})
+	go func() {
+		defer close(consoleDone)
+		bridgeConsole(vm.ConsoleSocket)
+	}()
+
 	// Wait for QEMU to finish
-	cmd.Wait()
+	rvm.cmd.Wait()
+
+	// Give console goroutine a moment to flush
+	select {
+	case <-consoleDone:
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	q.mu.Lock()
+	delete(q.running, vm.ID)
+	q.mu.Unlock()
 
 	// Use control channel exit code if available, otherwise 1
 	select {
-	case code := <-exitCh:
+	case code := <-rvm.exitCh:
 		return code, nil
 	default:
 		return 1, nil
@@ -111,7 +163,6 @@ func (q *QEMU) Start(ctx context.Context, vm *backend.VM, cfg *backend.VMConfig)
 }
 
 func (q *QEMU) readCtrl(socketPath string) int {
-	// Wait for socket to be available (QEMU creates it)
 	var conn net.Conn
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
@@ -120,7 +171,7 @@ func (q *QEMU) readCtrl(socketPath string) int {
 		if err == nil {
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 	if conn == nil {
 		return 1
@@ -159,5 +210,6 @@ func (q *QEMU) Stop(_ context.Context, vm *backend.VM) error {
 func (q *QEMU) Destroy(_ context.Context, vm *backend.VM) error {
 	os.Remove(vm.OverlayImg)
 	os.Remove(vm.CtrlSocket)
+	os.Remove(vm.ConsoleSocket)
 	return nil
 }

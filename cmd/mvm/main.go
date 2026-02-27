@@ -5,10 +5,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"text/tabwriter"
+	"time"
 
 	"github.com/cvhariharan/mvm/internal/backend/qemu"
 	"github.com/cvhariharan/mvm/internal/config"
 	"github.com/cvhariharan/mvm/internal/kernel"
+	"github.com/cvhariharan/mvm/internal/state"
 	"github.com/cvhariharan/mvm/internal/vm"
 	"github.com/spf13/cobra"
 )
@@ -17,6 +21,9 @@ var (
 	flagImage  string
 	flagMemory string
 	flagCPUs   int
+	flagName   string
+	flagDetach bool
+	flagForce  bool
 )
 
 func main() {
@@ -33,7 +40,7 @@ var rootCmd = &cobra.Command{
 
 var runCmd = &cobra.Command{
 	Use:   "run [flags] -- <command> [args...]",
-	Short: "Run a command in a microVM",
+	Short: "Run a command in an ephemeral microVM",
 	Args:  cobra.ArbitraryArgs,
 	RunE:  runRun,
 }
@@ -42,6 +49,48 @@ var shellCmd = &cobra.Command{
 	Use:   "shell",
 	Short: "Start an interactive shell in a microVM",
 	RunE:  runShell,
+}
+
+var createCmd = &cobra.Command{
+	Use:   "create [flags] [-- <command> [args...]]",
+	Short: "Create a microVM without starting it",
+	Args:  cobra.ArbitraryArgs,
+	RunE:  runCreate,
+}
+
+var startCmd = &cobra.Command{
+	Use:   "start <id-or-name>",
+	Short: "Start a created or stopped microVM",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runStart,
+}
+
+var stopCmd = &cobra.Command{
+	Use:   "stop <id-or-name>",
+	Short: "Stop a running microVM",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runStop,
+}
+
+var attachCmd = &cobra.Command{
+	Use:   "attach <id-or-name>",
+	Short: "Attach to a running microVM's console",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runAttach,
+}
+
+var rmCmd = &cobra.Command{
+	Use:   "rm <id-or-name>",
+	Short: "Remove a stopped microVM",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runRm,
+}
+
+var psCmd = &cobra.Command{
+	Use:     "ps",
+	Aliases: []string{"list"},
+	Short:   "List microVMs",
+	RunE:    runPs,
 }
 
 var initCmd = &cobra.Command{
@@ -75,14 +124,27 @@ var kernelListCmd = &cobra.Command{
 }
 
 func init() {
-	for _, cmd := range []*cobra.Command{runCmd, shellCmd, buildCmd} {
+	for _, cmd := range []*cobra.Command{runCmd, shellCmd, buildCmd, createCmd} {
 		cmd.Flags().StringVar(&flagImage, "image", "", "container image")
 		cmd.Flags().StringVar(&flagMemory, "memory", "", "memory size (e.g. 512M)")
 		cmd.Flags().IntVar(&flagCPUs, "cpus", 0, "number of CPUs")
 	}
 
+	for _, cmd := range []*cobra.Command{runCmd, createCmd} {
+		cmd.Flags().StringVar(&flagName, "name", "", "name for the VM")
+	}
+
+	startCmd.Flags().BoolVarP(&flagDetach, "detach", "d", false, "run in background")
+	rmCmd.Flags().BoolVarP(&flagForce, "force", "f", false, "stop the VM first if running")
+
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(shellCmd)
+	rootCmd.AddCommand(createCmd)
+	rootCmd.AddCommand(startCmd)
+	rootCmd.AddCommand(attachCmd)
+	rootCmd.AddCommand(stopCmd)
+	rootCmd.AddCommand(rmCmd)
+	rootCmd.AddCommand(psCmd)
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(buildCmd)
 	rootCmd.AddCommand(kernelCmd)
@@ -120,7 +182,11 @@ func createManager(cfg *config.Config, workDir string) (*vm.Manager, error) {
 	if err := b.Available(); err != nil {
 		return nil, fmt.Errorf("backend not available: %w", err)
 	}
-	return vm.NewManager(b, cfg, workDir), nil
+	store, err := state.NewStore()
+	if err != nil {
+		return nil, fmt.Errorf("state store: %w", err)
+	}
+	return vm.NewManager(b, cfg, workDir, store), nil
 }
 
 func runRun(cmd *cobra.Command, args []string) error {
@@ -131,10 +197,7 @@ func runRun(cmd *cobra.Command, args []string) error {
 
 	command := "/bin/sh"
 	if len(args) > 0 {
-		command = args[0]
-		for _, a := range args[1:] {
-			command += " " + a
-		}
+		command = strings.Join(args, " ")
 	}
 
 	mgr, err := createManager(cfg, workDir)
@@ -166,6 +229,146 @@ func runShell(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	os.Exit(exitCode)
+	return nil
+}
+
+func runCreate(cmd *cobra.Command, args []string) error {
+	cfg, workDir, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	command := ""
+	if len(args) > 0 {
+		command = strings.Join(args, " ")
+	}
+
+	mgr, err := createManager(cfg, workDir)
+	if err != nil {
+		return err
+	}
+
+	vmState, err := mgr.Create(context.Background(), vm.CreateOpts{
+		Name:    flagName,
+		Command: command,
+	})
+	if err != nil {
+		return err
+	}
+
+	if vmState.Name != "" {
+		fmt.Printf("%s (%s)\n", vmState.ID, vmState.Name)
+	} else {
+		fmt.Println(vmState.ID)
+	}
+	return nil
+}
+
+func runStart(cmd *cobra.Command, args []string) error {
+	cfg, workDir, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	mgr, err := createManager(cfg, workDir)
+	if err != nil {
+		return err
+	}
+
+	foreground := !flagDetach
+	exitCode, err := mgr.Start(context.Background(), args[0], foreground)
+	if err != nil {
+		return err
+	}
+
+	if flagDetach {
+		fmt.Printf("VM %s started in background\n", args[0])
+		return nil
+	}
+
+	os.Exit(exitCode)
+	return nil
+}
+
+func runStop(cmd *cobra.Command, args []string) error {
+	cfg, workDir, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	mgr, err := createManager(cfg, workDir)
+	if err != nil {
+		return err
+	}
+
+	if err := mgr.Stop(context.Background(), args[0]); err != nil {
+		return err
+	}
+
+	fmt.Printf("Stopped %s\n", args[0])
+	return nil
+}
+
+func runAttach(cmd *cobra.Command, args []string) error {
+	cfg, workDir, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	mgr, err := createManager(cfg, workDir)
+	if err != nil {
+		return err
+	}
+
+	consolePath, err := mgr.ConsolePath(args[0])
+	if err != nil {
+		return err
+	}
+
+	return qemu.AttachConsole(consolePath)
+}
+
+func runRm(cmd *cobra.Command, args []string) error {
+	cfg, workDir, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	mgr, err := createManager(cfg, workDir)
+	if err != nil {
+		return err
+	}
+
+	if err := mgr.Remove(context.Background(), args[0], flagForce); err != nil {
+		return err
+	}
+
+	fmt.Printf("Removed %s\n", args[0])
+	return nil
+}
+
+func runPs(cmd *cobra.Command, args []string) error {
+	store, err := state.NewStore()
+	if err != nil {
+		return err
+	}
+
+	vms, err := store.List()
+	if err != nil {
+		return err
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "ID\tNAME\tSTATUS\tCREATED\tIMAGE")
+	for _, v := range vms {
+		name := v.Name
+		if name == "" {
+			name = "-"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+			v.ID, name, v.Status, relativeTime(v.CreatedAt), v.Image)
+	}
+	w.Flush()
 	return nil
 }
 
@@ -238,4 +441,30 @@ func runKernelList(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  %s\n", item.Ref)
 	}
 	return nil
+}
+
+func relativeTime(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		m := int(d.Minutes())
+		if m == 1 {
+			return "1 minute ago"
+		}
+		return fmt.Sprintf("%d minutes ago", m)
+	case d < 24*time.Hour:
+		h := int(d.Hours())
+		if h == 1 {
+			return "1 hour ago"
+		}
+		return fmt.Sprintf("%d hours ago", h)
+	default:
+		days := int(d.Hours() / 24)
+		if days == 1 {
+			return "1 day ago"
+		}
+		return fmt.Sprintf("%d days ago", days)
+	}
 }

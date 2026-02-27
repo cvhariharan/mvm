@@ -497,7 +497,7 @@ func waitForDevice(path string, timeout time.Duration) error {
 		if _, err := os.Stat(path); err == nil {
 			return nil
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 	return fmt.Errorf("device %s did not appear within %s", path, timeout)
 }

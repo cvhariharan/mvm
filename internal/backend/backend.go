@@ -31,10 +31,11 @@ type WorkspaceConfig struct {
 
 // VM represents a created VM instance.
 type VM struct {
-	ID         string
-	OverlayImg string
-	CtrlSocket string
-	Pid        int
+	ID            string
+	OverlayImg    string
+	CtrlSocket    string
+	ConsoleSocket string
+	Pid           int
 }
 
 // Backend is the interface for VM lifecycle management.
@@ -42,7 +43,8 @@ type Backend interface {
 	Name() string
 	Available() error
 	Create(ctx context.Context, cfg *VMConfig) (*VM, error)
-	Start(ctx context.Context, vm *VM, cfg *VMConfig) (int, error)
+	Start(ctx context.Context, vm *VM, cfg *VMConfig) error      // non-blocking: launch VM, set vm.Pid, return
+	Attach(ctx context.Context, vm *VM, cfg *VMConfig) (int, error) // blocking: wait for exit, return exit code
 	Stop(ctx context.Context, vm *VM) error
 	Destroy(ctx context.Context, vm *VM) error
 }

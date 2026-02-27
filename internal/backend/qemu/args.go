@@ -15,10 +15,17 @@ func buildArgs(cfg *backend.VMConfig, vm *backend.VM) []string {
 		"-cpu", "host",
 		"-m", cfg.Memory,
 		"-smp", fmt.Sprintf("%d", cfg.CPUs),
-		"-nographic",
+		"-no-reboot",
+		"-display", "none",
 		"-kernel", cfg.Kernel,
 		"-initrd", cfg.Initrd,
 	}
+
+	// Serial console via unix socket (attach from any process)
+	args = append(args,
+		"-chardev", fmt.Sprintf("socket,id=console,path=%s,server=on,wait=off", vm.ConsoleSocket),
+		"-serial", "chardev:console",
+	)
 
 	// Root drive (qcow2 overlay)
 	args = append(args,
@@ -57,8 +64,9 @@ func buildArgs(cfg *backend.VMConfig, vm *backend.VM) []string {
 
 func buildCmdline(cfg *backend.VMConfig) string {
 	parts := []string{
-		"earlyprintk=ttyS0",
 		"console=ttyS0",
+		"quiet",
+		"no_timer_check",
 		"root=/dev/vda",
 		"rw",
 	}
