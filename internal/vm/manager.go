@@ -50,15 +50,15 @@ func (m *Manager) Run(ctx context.Context, command string) (int, error) {
 		return 1, fmt.Errorf("get kernel: %w", err)
 	}
 
-	// Build rootfs
-	fmt.Fprintf(os.Stderr, "Building rootfs: %s\n", m.cfg.VM.Image)
+	// Resolve rootfs (cached or build)
+	fmt.Fprintf(os.Stderr, "Resolving rootfs: %s\n", m.cfg.VM.Image)
 	builder, err := rootfs.NewBuilder()
 	if err != nil {
 		return 1, fmt.Errorf("rootfs builder: %w", err)
 	}
-	defer builder.Cleanup()
+	defer builder.Close()
 
-	rootfsPath, err := builder.Build(ctx, m.cfg.VM.Image)
+	rootfsPath, err := builder.Get(ctx, m.cfg.VM.Image)
 	if err != nil {
 		return 1, fmt.Errorf("build rootfs: %w", err)
 	}
@@ -131,14 +131,14 @@ func (m *Manager) Build(ctx context.Context) error {
 		return fmt.Errorf("get kernel: %w", err)
 	}
 
-	fmt.Printf("Building rootfs: %s\n", m.cfg.VM.Image)
+	fmt.Printf("Resolving rootfs: %s\n", m.cfg.VM.Image)
 	builder, err := rootfs.NewBuilder()
 	if err != nil {
 		return fmt.Errorf("rootfs builder: %w", err)
 	}
-	defer builder.Cleanup()
+	defer builder.Close()
 
-	if _, err := builder.Build(ctx, m.cfg.VM.Image); err != nil {
+	if _, err := builder.Get(ctx, m.cfg.VM.Image); err != nil {
 		return fmt.Errorf("build rootfs: %w", err)
 	}
 

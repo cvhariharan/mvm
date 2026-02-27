@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 
+	"github.com/cvhariharan/mvm/internal/cache"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 )
@@ -15,11 +16,12 @@ import (
 const (
 	rootfsFilename = "rootfs.img"
 	rootfsSize     = "2G"
+	cacheSubdir    = "rootfs"
 )
 
 type Builder struct {
-	client  *client.Client
-	workDir string
+	client *client.Client
+	cache  *cache.Cache
 }
 
 func NewBuilder() (*Builder, error) {
@@ -28,24 +30,43 @@ func NewBuilder() (*Builder, error) {
 		return nil, fmt.Errorf("failed to create docker client: %w", err)
 	}
 
-	workDir, err := os.MkdirTemp("", "mvm-rootfs-")
+	c, err := cache.New(cacheSubdir)
 	if err != nil {
 		cli.Close()
 		return nil, err
 	}
 
 	return &Builder{
-		client:  cli,
-		workDir: workDir,
+		client: cli,
+		cache:  c,
 	}, nil
 }
 
-// Build creates an ext4 rootfs image from a container image.
-// Returns the path to the created image.
-func (b *Builder) Build(ctx context.Context, imageName string) (string, error) {
-	rootfsDir := filepath.Join(b.workDir, "rootfs")
-	rootfsTar := filepath.Join(b.workDir, "rootfs.tar")
-	rootfsImg := filepath.Join(b.workDir, rootfsFilename)
+// Get returns the path to a cached rootfs, building it if necessary.
+func (b *Builder) Get(ctx context.Context, imageName string) (string, error) {
+	if b.cache.Exists(imageName, rootfsFilename) {
+		return b.cache.FilePath(imageName, rootfsFilename), nil
+	}
+	return b.build(ctx, imageName)
+}
+
+// Close releases the Docker client.
+func (b *Builder) Close() {
+	if b.client != nil {
+		b.client.Close()
+	}
+}
+
+func (b *Builder) build(ctx context.Context, imageName string) (string, error) {
+	workDir, err := os.MkdirTemp("", "mvm-rootfs-")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(workDir)
+
+	rootfsDir := filepath.Join(workDir, "rootfs")
+	rootfsTar := filepath.Join(workDir, "rootfs.tar")
+	rootfsImg := filepath.Join(workDir, rootfsFilename)
 
 	if err := b.pullImage(ctx, imageName); err != nil {
 		return "", err
@@ -72,15 +93,17 @@ func (b *Builder) Build(ctx context.Context, imageName string) (string, error) {
 		return "", err
 	}
 
-	return rootfsImg, nil
-}
-
-// Cleanup removes temporary files and closes the client.
-func (b *Builder) Cleanup() {
-	os.RemoveAll(b.workDir)
-	if b.client != nil {
-		b.client.Close()
+	// Move result into cache
+	if err := b.cache.EnsureDir(imageName); err != nil {
+		return "", err
 	}
+	destPath := b.cache.FilePath(imageName, rootfsFilename)
+	if err := copyFile(rootfsImg, destPath); err != nil {
+		return "", fmt.Errorf("cache rootfs: %w", err)
+	}
+	b.cache.StoreMetadata(imageName, "ref", imageName)
+
+	return destPath, nil
 }
 
 func (b *Builder) pullImage(ctx context.Context, imageName string) error {
@@ -136,4 +159,21 @@ func (b *Builder) createExt4Image(rootfsDir, imagePath string) error {
 func extractTar(tarPath, destDir string) error {
 	cmd := exec.Command("tar", "-xf", tarPath, "-C", destDir)
 	return cmd.Run()
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, in)
+	return err
 }
