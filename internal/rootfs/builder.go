@@ -18,14 +18,17 @@ const (
 	rootfsSize     = "2G"
 )
 
-// Builder creates ext4 rootfs images from container images.
 type Builder struct {
-	client  *client.Client
-	workDir string
+	client     *client.Client
+	workDir    string
+	initBinary string
 }
 
-// NewBuilder creates a new rootfs builder.
-func NewBuilder() (*Builder, error) {
+func NewBuilder(initBinary string) (*Builder, error) {
+	if _, err := os.Stat(initBinary); err != nil {
+		return nil, fmt.Errorf("init binary not found: %w", err)
+	}
+
 	cli, err := client.New(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create docker client: %w", err)
@@ -38,8 +41,9 @@ func NewBuilder() (*Builder, error) {
 	}
 
 	return &Builder{
-		client:  cli,
-		workDir: workDir,
+		client:     cli,
+		workDir:    workDir,
+		initBinary: initBinary,
 	}, nil
 }
 
@@ -202,35 +206,13 @@ func (b *Builder) injectInit(rootfsDir string) error {
 		return err
 	}
 
-	initScript := `#!/bin/sh
-# mvm smart init - handles container images without init systems
+	src, err := os.ReadFile(b.initBinary)
+	if err != nil {
+		return fmt.Errorf("read init binary: %w", err)
+	}
 
-# Mount essential filesystems
-mount -t proc proc /proc 2>/dev/null
-mount -t sysfs sys /sys 2>/dev/null
-mount -t devtmpfs dev /dev 2>/dev/null
-
-# Mount 9p shares from fstab
-mount -a 2>/dev/null
-
-# Run user's start script if exists
-if [ -x /etc/mvm-start.sh ]; then
-    /etc/mvm-start.sh
-fi
-
-# Try to find and exec a real init
-for init in /sbin/init /usr/lib/systemd/systemd /sbin/openrc-init; do
-    if [ -x "$init" ] && [ "$init" != "/sbin/mvm-init" ]; then
-        exec "$init"
-    fi
-done
-
-# Fallback to interactive shell
-echo "mvm: No init system found, starting shell..."
-exec /bin/sh
-`
 	initPath := filepath.Join(sbinDir, "mvm-init")
-	return os.WriteFile(initPath, []byte(initScript), 0755)
+	return os.WriteFile(initPath, src, 0755)
 }
 
 func (b *Builder) createExt4Image(rootfsDir, imagePath string) error {

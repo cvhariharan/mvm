@@ -106,9 +106,10 @@ func runVM(cmd *cobra.Command, args []string) error {
 		mounts = append(mounts, microvm.Mount{Host: hostPath, Guest: m.Guest})
 	}
 
-	// Build rootfs
+	initBinary := filepath.Join(workDir, "bin", "mvm-init")
+
 	fmt.Println("Building rootfs...")
-	builder, err := rootfs.NewBuilder()
+	builder, err := rootfs.NewBuilder(initBinary)
 	if err != nil {
 		return fmt.Errorf("failed to create rootfs builder: %w", err)
 	}
