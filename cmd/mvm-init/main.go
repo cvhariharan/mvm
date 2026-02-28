@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	ctrlDevPath        = "/dev/vport0p1"
+	ctrlPortName       = "mvm.ctrl"
 	newRoot            = "/newroot"
 	servicesConfigPath = "/etc/mvm/services.ini"
 )
@@ -756,18 +756,42 @@ func mountExtra(mounts []extraMount, prefix string) {
 }
 
 func openCtrl() io.ReadWriteCloser {
-	// Wait for the virtio-serial device to appear — the driver may not
-	// have initialised yet when mvm-init reaches this point.
+	// Resolve the virtio-serial port by name via sysfs, then open it.
+	// The port index (vport0p1, vport1p1, …) depends on the order QEMU
+	// enumerates virtio devices, so we can't hardcode it.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		f, err := os.OpenFile(ctrlDevPath, os.O_RDWR, 0)
-		if err == nil {
-			return f
+		if path := ctrlDevPath(); path != "" {
+			f, err := os.OpenFile(path, os.O_RDWR, 0)
+			if err == nil {
+				return f
+			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	fmt.Fprintf(os.Stderr, "mvm-init: ctrl device %s not available, running without control channel\n", ctrlDevPath)
+	fmt.Fprintf(os.Stderr, "mvm-init: ctrl port %q not available, running without control channel\n", ctrlPortName)
 	return nopRWC{}
+}
+
+// ctrlDevPath resolves the /dev/vport* path for the named virtio-serial port.
+// The kernel keys /sys/class/virtio-ports/ by device node (e.g. vport1p1),
+// not by port name, so we scan all entries and match on the name file.
+func ctrlDevPath() string {
+	entries, err := os.ReadDir("/sys/class/virtio-ports")
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		nameFile := "/sys/class/virtio-ports/" + e.Name() + "/name"
+		data, err := os.ReadFile(nameFile)
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(data)) == ctrlPortName {
+			return "/dev/" + e.Name()
+		}
+	}
+	return ""
 }
 
 type nopRWC struct{}
