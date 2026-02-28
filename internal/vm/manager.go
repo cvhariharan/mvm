@@ -284,21 +284,31 @@ func (m *Manager) Run(ctx context.Context, command string) (int, error) {
 	vmState.StartedAt = time.Now()
 	m.store.Save(vmState)
 
-	// Bridge console in a goroutine — will close when QEMU exits
-	go m.backend.Attach(ctx, vm)
+	type result struct{ code int }
+	exitCh := make(chan result, 2)
 
-	// Wait for the guest command to finish (exit code from ctrl channel)
-	exitCode, _ := m.backend.WaitExit(ctx, vm)
+	// Wait for guest workload exit via ctrl channel.
+	go func() {
+		code, _ := m.backend.WaitExit(ctx, vm)
+		exitCh <- result{code}
+	}()
 
-	// Stop the VM (mvm-init stays alive after workload, so we kill QEMU)
+	// Bridge console — returns when user detaches (Ctrl+]) or socket closes.
+	go func() {
+		m.backend.Attach(ctx, vm)
+		exitCh <- result{0}
+	}()
+
+	// Whichever happens first (workload done or user detaches) ends the session.
+	res := <-exitCh
+
+	// Stop the VM and clean up.
 	m.backend.Stop(ctx, vm)
-
-	// Clean up
 	if err := m.Remove(ctx, vmState.ID, true); err != nil {
 		fmt.Fprintf(os.Stderr, "cleanup: %v\n", err)
 	}
 
-	return exitCode, nil
+	return res.code, nil
 }
 
 // Build pre-caches the kernel and rootfs without running a VM.

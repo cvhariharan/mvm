@@ -86,8 +86,10 @@ func (q *QEMU) Start(ctx context.Context, vm *backend.VM, cfg *backend.VMConfig)
 
 	qemuCtx, cancel := context.WithCancel(ctx)
 	cmd := exec.CommandContext(qemuCtx, "qemu-system-x86_64", args...)
-	// No stdin/stdout — console goes through the socket
+	// No stdin/stdout — console goes through the socket.
+	// New process group so terminal signals (Ctrl+C) don't reach QEMU.
 	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
 		cancel()
