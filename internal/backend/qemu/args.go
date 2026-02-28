@@ -74,6 +74,7 @@ func buildCmdline(cfg *backend.VMConfig) string {
 	parts := []string{
 		"console=ttyS0",
 		"quiet",
+		"loglevel=0",
 		"no_timer_check",
 		"root=/dev/vda",
 		"rw",
@@ -85,6 +86,9 @@ func buildCmdline(cfg *backend.VMConfig) string {
 	if cfg.UID != "" {
 		parts = append(parts, "mvm.uid="+cfg.UID)
 	}
+	if cfg.Hostname != "" {
+		parts = append(parts, "mvm.hostname="+cfg.Hostname)
+	}
 	if cfg.Workspace.GuestDir != "" {
 		parts = append(parts, "mvm.ws="+cfg.Workspace.GuestDir)
 	}
@@ -94,6 +98,9 @@ func buildCmdline(cfg *backend.VMConfig) string {
 	if len(cfg.ExtraMounts) > 0 {
 		parts = append(parts, "mvm.mounts="+encodeMounts(cfg.ExtraMounts))
 	}
+	if len(cfg.Users) > 0 {
+		parts = append(parts, "mvm.users="+encodeUsers(cfg.Users))
+	}
 
 	return strings.Join(parts, " ")
 }
@@ -102,6 +109,15 @@ func encodeEnv(env map[string]string) string {
 	var lines []string
 	for k, v := range env {
 		lines = append(lines, k+"="+v)
+	}
+	return base64.StdEncoding.EncodeToString([]byte(strings.Join(lines, "\n")))
+}
+
+// encodeUsers encodes users as base64("name:uid:gid\n...")
+func encodeUsers(users []backend.User) string {
+	var lines []string
+	for _, u := range users {
+		lines = append(lines, fmt.Sprintf("%s:%d:%d", u.Name, u.UID, u.GID))
 	}
 	return base64.StdEncoding.EncodeToString([]byte(strings.Join(lines, "\n")))
 }

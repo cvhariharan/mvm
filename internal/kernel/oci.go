@@ -64,9 +64,9 @@ func (p *Puller) Pull(ref string) (string, error) {
 		fmt.Printf("Using local image %s\n", ref)
 	}
 
-	// Create container to export filesystem
+	// Create container to export filesystem (entrypoint never runs; required by Podman for scratch images)
 	createResp, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
-		Config: &container.Config{Image: ref},
+		Config: &container.Config{Image: ref, Entrypoint: []string{"/bin/true"}},
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to create container: %w", err)

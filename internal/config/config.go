@@ -28,6 +28,13 @@ type Config struct {
 	Mounts  MountConfig       `koanf:"mounts"`
 	Cache   CacheConfig       `koanf:"cache"`
 	Env     map[string]string `koanf:"env"`
+	Users   []UserConfig      `koanf:"users"`
+}
+
+type UserConfig struct {
+	Name string `koanf:"name"`
+	UID  int    `koanf:"uid"`
+	GID  int    `koanf:"gid"`
 }
 
 type VMConfig struct {

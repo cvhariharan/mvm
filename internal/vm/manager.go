@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"os/user"
 	"strconv"
 	"syscall"
 	"time"
@@ -82,7 +83,13 @@ func (m *Manager) Create(ctx context.Context, opts CreateOpts) (*state.VMState, 
 		return nil, err
 	}
 
-	uid := strconv.Itoa(os.Getuid()) + ":" + strconv.Itoa(os.Getgid())
+	hostUID := os.Getuid()
+	hostGID := os.Getgid()
+	hostUser, err := user.Current()
+	if err != nil {
+		return nil, fmt.Errorf("get current user: %w", err)
+	}
+	uid := strconv.Itoa(hostUID) + ":" + strconv.Itoa(hostGID)
 	vmDir := m.store.VMDir(id)
 
 	vmState := &state.VMState{
@@ -112,6 +119,21 @@ func (m *Manager) Create(ctx context.Context, opts CreateOpts) (*state.VMState, 
 			GuestDir: m.cfg.Mounts.Workspace,
 		},
 		Env: m.cfg.Env,
+	}
+
+	// Always create a guest user matching the host user (same name, uid, gid)
+	// so that file ownership is consistent across host and guest.
+	vmState.Users = append(vmState.Users, state.UserState{
+		Name: hostUser.Username,
+		UID:  hostUID,
+		GID:  hostGID,
+	})
+	for _, u := range m.cfg.Users {
+		vmState.Users = append(vmState.Users, state.UserState{
+			Name: u.Name,
+			UID:  u.UID,
+			GID:  u.GID,
+		})
 	}
 
 	// Resolve extra mounts from config
@@ -336,7 +358,17 @@ func stateToVMConfig(s *state.VMState) *backend.VMConfig {
 		Env:         s.Env,
 		Command:     s.Command,
 		UID:         s.UID,
+		Hostname:    s.Hostname(),
+		Users:       stateUsersToBackend(s.Users),
 	}
+}
+
+func stateUsersToBackend(users []state.UserState) []backend.User {
+	var out []backend.User
+	for _, u := range users {
+		out = append(out, backend.User{Name: u.Name, UID: u.UID, GID: u.GID})
+	}
+	return out
 }
 
 // stateToVM converts persisted state to the backend VM handle.

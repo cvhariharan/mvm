@@ -17,7 +17,15 @@ type VMConfig struct {
 	Env         map[string]string
 	Command     string
 	UID         string
+	Hostname    string
 	CtrlSocket  string
+	Users       []User
+}
+
+type User struct {
+	Name string
+	UID  int
+	GID  int
 }
 
 // Mount describes a host→guest 9p bind mount.

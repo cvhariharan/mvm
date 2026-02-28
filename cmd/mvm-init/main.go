@@ -67,8 +67,10 @@ func run() error {
 	mvmCmd := params["mvm.cmd"]
 	mvmUID := params["mvm.uid"]
 	mvmWS := params["mvm.ws"]
+	mvmHostname := params["mvm.hostname"]
 	mvmEnv := decodeEnv(params["mvm.env"])
 	mvmMounts := decodeMounts(params["mvm.mounts"])
+	mvmUsers := decodeUsers(params["mvm.users"])
 
 	if isInitrd() {
 		rootDev := params["root"]
@@ -92,6 +94,13 @@ func run() error {
 		writeFile("/etc/hosts", "127.0.0.1 localhost\n::1 localhost\n", 0644)
 	}
 
+	createUsers(mvmUsers)
+
+	if mvmHostname != "" {
+		syscall.Sethostname([]byte(mvmHostname))
+		writeFile("/etc/hostname", mvmHostname+"\n", 0644)
+	}
+
 	setupNetworking()
 
 	ctrl := openCtrl()
@@ -108,9 +117,9 @@ func run() error {
 	// Run initial workload
 	exitCode := 0
 	if mvmCmd != "" {
-		exitCode = runWorkload(mvmCmd, mvmEnv, mvmUID)
+		exitCode = runWorkload(mvmCmd, mvmEnv, mvmUID, mvmUsers)
 	} else {
-		exitCode = runWorkload("/bin/sh", mvmEnv, mvmUID)
+		exitCode = runWorkload("/bin/sh", mvmEnv, mvmUID, mvmUsers)
 	}
 	sendMsg(ctrl, proto.Message{Type: proto.TypeExit, Payload: mustJSON(proto.ExitPayload{Code: exitCode})})
 
@@ -119,7 +128,7 @@ func run() error {
 		// No ctrl channel — respawn a shell each time it exits.
 		// The VM stays alive until QEMU is killed externally (mvm stop).
 		for {
-			runWorkload("/bin/sh", mvmEnv, mvmUID)
+			runWorkload("/bin/sh", mvmEnv, mvmUID, mvmUsers)
 		}
 	}
 
@@ -136,7 +145,7 @@ func run() error {
 			for k, v := range p.Env {
 				mvmEnv[k] = v
 			}
-			code := runWorkload(p.Cmd, mvmEnv, mvmUID)
+			code := runWorkload(p.Cmd, mvmEnv, mvmUID, mvmUsers)
 			sendMsg(ctrl, proto.Message{Type: proto.TypeExit, Payload: mustJSON(proto.ExitPayload{Code: code})})
 		}
 	}
@@ -148,7 +157,7 @@ func run() error {
 	return nil
 }
 
-func runWorkload(cmd string, env map[string]string, uidGid string) int {
+func runWorkload(cmd string, env map[string]string, uidGid string, users []user) int {
 	parts := strings.Fields(cmd)
 	if len(parts) == 0 {
 		return 0
@@ -158,13 +167,27 @@ func runWorkload(cmd string, env map[string]string, uidGid string) int {
 	c.Stdin = os.Stdin
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
-	c.Env = buildEnv(env)
-
 	if uidGid != "" {
 		uid, gid := parseUIDGID(uidGid)
 		c.SysProcAttr = &syscall.SysProcAttr{
 			Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)},
 		}
+		// Build env with HOME and USER overridden for the workload user.
+		overrides := map[string]string{}
+		for k, v := range env {
+			overrides[k] = v
+		}
+		for _, u := range users {
+			if u.UID == uid {
+				overrides["USER"] = u.Name
+				overrides["HOME"] = "/home/" + u.Name
+				c.Dir = "/home/" + u.Name
+				break
+			}
+		}
+		c.Env = buildEnv(overrides)
+	} else {
+		c.Env = buildEnv(env)
 	}
 
 	if err := c.Run(); err != nil {
@@ -176,7 +199,7 @@ func runWorkload(cmd string, env map[string]string, uidGid string) int {
 	return 0
 }
 
-func waitForExec(ctrl io.ReadWriteCloser, env map[string]string, uidGid string) int {
+func waitForExec(ctrl io.ReadWriteCloser, env map[string]string, uidGid string, users []user) int {
 	dec := json.NewDecoder(ctrl)
 	for {
 		var msg proto.Message
@@ -189,7 +212,7 @@ func waitForExec(ctrl io.ReadWriteCloser, env map[string]string, uidGid string) 
 			for k, v := range p.Env {
 				env[k] = v
 			}
-			return runWorkload(p.Cmd, env, uidGid)
+			return runWorkload(p.Cmd, env, uidGid, users)
 		}
 	}
 }
@@ -537,7 +560,23 @@ func writeFile(path, content string, mode os.FileMode) {
 }
 
 func buildEnv(extra map[string]string) []string {
-	env := os.Environ()
+	// Build override set for fast lookup.
+	overrideKeys := make(map[string]bool, len(extra))
+	for k := range extra {
+		overrideKeys[strings.ToUpper(k)] = true
+	}
+	// Start from the inherited environment, skipping keys that will be overridden.
+	var env []string
+	for _, kv := range os.Environ() {
+		idx := strings.IndexByte(kv, '=')
+		if idx < 0 {
+			continue
+		}
+		key := kv[:idx]
+		if !overrideKeys[strings.ToUpper(key)] {
+			env = append(env, kv)
+		}
+	}
 	for k, v := range extra {
 		env = append(env, k+"="+v)
 	}
@@ -593,6 +632,110 @@ func decodeMounts(encoded string) []extraMount {
 		}
 	}
 	return mounts
+}
+
+type user struct {
+	Name string
+	UID  int
+	GID  int
+}
+
+func decodeUsers(encoded string) []user {
+	if encoded == "" {
+		return nil
+	}
+	b, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil
+	}
+	var users []user
+	for _, line := range strings.Split(string(b), "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		uid, _ := strconv.Atoi(parts[1])
+		gid, _ := strconv.Atoi(parts[2])
+		users = append(users, user{Name: parts[0], UID: uid, GID: gid})
+	}
+	return users
+}
+
+func createUsers(users []user) {
+	for _, u := range users {
+		upsertPasswd(u)
+		upsertGroup(u)
+		upsertShadow(u)
+		ensureHome(u)
+	}
+}
+
+func upsertPasswd(u user) {
+	homeDir := "/home/" + u.Name
+	newLine := fmt.Sprintf("%s:x:%d:%d::%s:/bin/sh", u.Name, u.UID, u.GID, homeDir)
+	uidField := fmt.Sprintf(":%d:", u.UID)
+	rewriteOrAppendEvict("/etc/passwd", u.Name+":", uidField, newLine)
+}
+
+func upsertGroup(u user) {
+	newLine := fmt.Sprintf("%s:x:%d:", u.Name, u.GID)
+	gidField := fmt.Sprintf(":x:%d:", u.GID)
+	rewriteOrAppendEvict("/etc/group", u.Name+":", gidField, newLine)
+}
+
+func upsertShadow(u user) {
+	if _, err := os.Stat("/etc/shadow"); err != nil {
+		return // no shadow file — skip
+	}
+	shadowLine := u.Name + "::1::::::"
+	rewriteOrAppend("/etc/shadow", u.Name+":", shadowLine)
+}
+
+func ensureHome(u user) {
+	homeDir := "/home/" + u.Name
+	os.MkdirAll(homeDir, 0755)
+	os.Chown(homeDir, u.UID, u.GID)
+}
+
+// rewriteOrAppendEvict rewrites any line starting with namePrefix to newLine,
+// and removes any other lines containing evictField (e.g. ":1000:" to evict
+// conflicting uid/gid entries from other users). If no name match exists,
+// newLine is appended. The file is rewritten in place.
+func rewriteOrAppendEvict(path, namePrefix, evictField, newLine string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		os.WriteFile(path, []byte(newLine+"\n"), 0644)
+		return
+	}
+	lines := strings.Split(string(data), "\n")
+	found := false
+	var out []string
+	for _, line := range lines {
+		if strings.HasPrefix(line, namePrefix) {
+			if !found {
+				out = append(out, newLine)
+				found = true
+			}
+			// drop old entry for this name
+		} else if evictField != "" && strings.Contains(line, evictField) {
+			// drop conflicting uid/gid entry from another user
+		} else {
+			out = append(out, line)
+		}
+	}
+	if !found {
+		out = append(out, newLine)
+	}
+	result := strings.Join(out, "\n")
+	if !strings.HasSuffix(result, "\n") {
+		result += "\n"
+	}
+	os.WriteFile(path, []byte(result), 0644)
+}
+
+// rewriteOrAppend is rewriteOrAppendEvict without eviction (used for shadow).
+func rewriteOrAppend(path, prefix, newLine string) {
+	rewriteOrAppendEvict(path, prefix, "", newLine)
 }
 
 // mountExtra mounts all extra 9p filesystems. If prefix is non-empty,

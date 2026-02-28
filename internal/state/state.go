@@ -48,6 +48,13 @@ type VMState struct {
 	Env         map[string]string `json:"env,omitempty"`
 	Command     string            `json:"command,omitempty"`
 	UID         string            `json:"uid"`
+	Users       []UserState       `json:"users,omitempty"`
+}
+
+type UserState struct {
+	Name string `json:"name"`
+	UID  int    `json:"uid"`
+	GID  int    `json:"gid"`
 }
 
 // MountState describes a persisted host→guest 9p mount.
@@ -65,6 +72,14 @@ type NetworkState struct {
 type WorkspaceState struct {
 	HostDir  string `json:"host_dir"`
 	GuestDir string `json:"guest_dir"`
+}
+
+// Hostname returns the VM name if set, otherwise the short ID.
+func (s *VMState) Hostname() string {
+	if s.Name != "" {
+		return s.Name
+	}
+	return s.ID
 }
 
 // IsAlive checks whether the QEMU process is still running.
