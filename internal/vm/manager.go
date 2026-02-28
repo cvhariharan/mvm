@@ -20,8 +20,9 @@ import (
 )
 
 type CreateOpts struct {
-	Name    string
-	Command string
+	Name      string
+	Command   string
+	Ephemeral bool // if true, state is never written to the store
 }
 
 type Manager struct {
@@ -155,8 +156,14 @@ func (m *Manager) Create(ctx context.Context, opts CreateOpts) (*state.VMState, 
 		return nil, fmt.Errorf("create vm: %w", err)
 	}
 
-	if err := m.store.Save(vmState); err != nil {
-		return nil, fmt.Errorf("save state: %w", err)
+	if opts.Ephemeral {
+		if err := os.MkdirAll(m.store.VMDir(id), 0755); err != nil {
+			return nil, fmt.Errorf("create vm dir: %w", err)
+		}
+	} else {
+		if err := m.store.Save(vmState); err != nil {
+			return nil, fmt.Errorf("save state: %w", err)
+		}
 	}
 
 	return vmState, nil
@@ -266,7 +273,7 @@ func (m *Manager) List() ([]*state.VMState, error) {
 // Run is the ephemeral shortcut: create, start, attach console, wait for
 // the command to finish, stop the VM, and clean up.
 func (m *Manager) Run(ctx context.Context, command string) (int, error) {
-	vmState, err := m.Create(ctx, CreateOpts{Command: command})
+	vmState, err := m.Create(ctx, CreateOpts{Command: command, Ephemeral: true})
 	if err != nil {
 		return 1, err
 	}
@@ -275,14 +282,10 @@ func (m *Manager) Run(ctx context.Context, command string) (int, error) {
 	vm := stateToVM(vmState)
 
 	if err := m.backend.Start(ctx, vm, vmCfg); err != nil {
-		m.Remove(ctx, vmState.ID, true)
+		m.backend.Destroy(ctx, vm)
+		os.RemoveAll(m.store.VMDir(vmState.ID))
 		return 1, fmt.Errorf("start vm: %w", err)
 	}
-
-	vmState.Status = state.StatusRunning
-	vmState.Pid = vm.Pid
-	vmState.StartedAt = time.Now()
-	m.store.Save(vmState)
 
 	type result struct{ code int }
 	exitCh := make(chan result, 2)
@@ -302,11 +305,10 @@ func (m *Manager) Run(ctx context.Context, command string) (int, error) {
 	// Whichever happens first (workload done or user detaches) ends the session.
 	res := <-exitCh
 
-	// Stop the VM and clean up.
+	// Stop the VM and clean up without touching the store.
 	m.backend.Stop(ctx, vm)
-	if err := m.Remove(ctx, vmState.ID, true); err != nil {
-		fmt.Fprintf(os.Stderr, "cleanup: %v\n", err)
-	}
+	m.backend.Destroy(ctx, vm)
+	os.RemoveAll(m.store.VMDir(vmState.ID))
 
 	return res.code, nil
 }

@@ -420,7 +420,7 @@ func runPs(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "ID\tNAME\tSTATUS\tCREATED\tIMAGE\tCOMMAND")
 	for _, v := range vms {
 		name := v.Name
