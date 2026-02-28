@@ -47,8 +47,8 @@ var runCmd = &cobra.Command{
 
 var shellCmd = &cobra.Command{
 	Use:   "shell",
-	Short: "Start an interactive shell in a microVM",
-	RunE:  runShell,
+	Short: "Start an interactive shell in a microVM (alias for: run)",
+	RunE:  runRun,
 }
 
 var createCmd = &cobra.Command{
@@ -105,6 +105,12 @@ var buildCmd = &cobra.Command{
 	RunE:  runBuild,
 }
 
+var upCmd = &cobra.Command{
+	Use:   "up",
+	Short: "Start or attach to a persistent microVM (create if needed)",
+	RunE:  runUp,
+}
+
 var kernelCmd = &cobra.Command{
 	Use:   "kernel",
 	Short: "Kernel management commands",
@@ -124,17 +130,18 @@ var kernelListCmd = &cobra.Command{
 }
 
 func init() {
-	for _, cmd := range []*cobra.Command{runCmd, shellCmd, buildCmd, createCmd} {
+	for _, cmd := range []*cobra.Command{runCmd, shellCmd, buildCmd, createCmd, upCmd} {
 		cmd.Flags().StringVar(&flagImage, "image", "", "container image")
 		cmd.Flags().StringVar(&flagMemory, "memory", "", "memory size (e.g. 512M)")
 		cmd.Flags().IntVar(&flagCPUs, "cpus", 0, "number of CPUs")
 	}
 
-	for _, cmd := range []*cobra.Command{runCmd, createCmd} {
+	for _, cmd := range []*cobra.Command{runCmd, createCmd, shellCmd, upCmd} {
 		cmd.Flags().StringVar(&flagName, "name", "", "name for the VM")
 	}
 
 	startCmd.Flags().BoolVarP(&flagDetach, "detach", "d", false, "run in background")
+	upCmd.Flags().BoolVarP(&flagDetach, "detach", "d", false, "run in background")
 	rmCmd.Flags().BoolVarP(&flagForce, "force", "f", false, "stop the VM first if running")
 
 	rootCmd.AddCommand(runCmd)
@@ -147,6 +154,7 @@ func init() {
 	rootCmd.AddCommand(psCmd)
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(buildCmd)
+	rootCmd.AddCommand(upCmd)
 	rootCmd.AddCommand(kernelCmd)
 	kernelCmd.AddCommand(kernelPullCmd)
 	kernelCmd.AddCommand(kernelListCmd)
@@ -213,7 +221,7 @@ func runRun(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func runShell(cmd *cobra.Command, args []string) error {
+func runUp(cmd *cobra.Command, args []string) error {
 	cfg, workDir, err := loadConfig()
 	if err != nil {
 		return err
@@ -224,10 +232,64 @@ func runShell(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	exitCode, err := mgr.Run(context.Background(), "/bin/sh")
+	foreground := !flagDetach
+
+	if flagName != "" {
+		store, err := state.NewStore()
+		if err != nil {
+			return fmt.Errorf("state store: %w", err)
+		}
+		vmState, lookupErr := store.Lookup(flagName)
+		if lookupErr == nil {
+			switch vmState.Status {
+			case state.StatusRunning:
+				if flagDetach {
+					fmt.Printf("VM %q is already running (%s)\n", flagName, vmState.ID)
+					return nil
+				}
+				fmt.Printf("Re-attaching to running VM %q (%s)...\n", flagName, vmState.ID)
+				return qemu.AttachConsole(vmState.ConsolePath)
+			case state.StatusCreated, state.StatusStopped:
+				fmt.Printf("Starting VM %q (%s)...\n", flagName, vmState.ID)
+				exitCode, err := mgr.Start(context.Background(), vmState.ID, foreground)
+				if err != nil {
+					return err
+				}
+				if flagDetach {
+					fmt.Printf("VM %q started in background\n", flagName)
+					return nil
+				}
+				os.Exit(exitCode)
+				return nil
+			}
+		}
+		// VM doesn't exist — fall through to create + start
+	}
+
+	// Create + start (named or anonymous)
+	vmState, err := mgr.Create(context.Background(), vm.CreateOpts{
+		Name:    flagName,
+		Command: "/bin/sh",
+	})
 	if err != nil {
 		return err
 	}
+
+	exitCode, err := mgr.Start(context.Background(), vmState.ID, foreground)
+	if err != nil {
+		mgr.Remove(context.Background(), vmState.ID, false)
+		return err
+	}
+
+	if flagDetach {
+		if flagName != "" {
+			fmt.Printf("VM %q started in background (%s)\n", flagName, vmState.ID)
+		} else {
+			fmt.Printf("VM %s started in background\n", vmState.ID)
+		}
+		return nil
+	}
+
 	os.Exit(exitCode)
 	return nil
 }
@@ -359,14 +421,18 @@ func runPs(cmd *cobra.Command, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tNAME\tSTATUS\tCREATED\tIMAGE")
+	fmt.Fprintln(w, "ID\tNAME\tSTATUS\tCREATED\tIMAGE\tCOMMAND")
 	for _, v := range vms {
 		name := v.Name
 		if name == "" {
 			name = "-"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
-			v.ID, name, v.Status, relativeTime(v.CreatedAt), v.Image)
+		command := v.Command
+		if command == "" {
+			command = "-"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			v.ID, name, v.Status, relativeTime(v.CreatedAt), v.Image, command)
 	}
 	w.Flush()
 	return nil
