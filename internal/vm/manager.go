@@ -120,10 +120,11 @@ func (m *Manager) Create(ctx context.Context, opts CreateOpts) (*state.VMState, 
 			Ports: configPortsToState(m.cfg.Network.Ports),
 		},
 		Workspace: func() state.WorkspaceState {
+			ws := state.WorkspaceState{HostDir: m.workDir}
 			if m.cfg.Mounts.MountWorkspace {
-				return state.WorkspaceState{HostDir: m.workDir, GuestDir: m.workDir}
+				ws.GuestDir = m.workDir
 			}
-			return state.WorkspaceState{}
+			return ws
 		}(),
 		Env: m.cfg.Env,
 	}

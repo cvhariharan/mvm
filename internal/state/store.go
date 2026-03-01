@@ -121,6 +121,32 @@ func (s *Store) Lookup(idOrName string) (*VMState, error) {
 	}
 }
 
+// LookupByWorkspace finds the VM whose Workspace.HostDir matches dir exactly.
+// Returns (nil, nil) if no such VM exists (caller should create one).
+// Returns (nil, err) on I/O failures.
+func (s *Store) LookupByWorkspace(dir string) (*VMState, error) {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		vm, err := s.Load(entry.Name())
+		if err != nil {
+			continue
+		}
+		if vm.Workspace.HostDir == dir {
+			return vm, nil
+		}
+	}
+	return nil, nil
+}
+
 // List returns all VM states, reconciling stale entries.
 func (s *Store) List() ([]*VMState, error) {
 	entries, err := os.ReadDir(s.dir)

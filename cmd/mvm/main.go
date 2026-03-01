@@ -66,16 +66,16 @@ var startCmd = &cobra.Command{
 }
 
 var stopCmd = &cobra.Command{
-	Use:   "stop <id-or-name>",
-	Short: "Stop a running microVM",
-	Args:  cobra.ExactArgs(1),
+	Use:   "stop [id-or-name]",
+	Short: "Stop a running microVM (no arg = workspace VM)",
+	Args:  cobra.MaximumNArgs(1),
 	RunE:  runStop,
 }
 
 var attachCmd = &cobra.Command{
-	Use:   "attach <id-or-name>",
-	Short: "Attach to a running microVM's console",
-	Args:  cobra.ExactArgs(1),
+	Use:   "attach [id-or-name]",
+	Short: "Attach to a running microVM's console (no arg = workspace VM)",
+	Args:  cobra.MaximumNArgs(1),
 	RunE:  runAttach,
 }
 
@@ -107,8 +107,14 @@ var buildCmd = &cobra.Command{
 
 var upCmd = &cobra.Command{
 	Use:   "up",
-	Short: "Start or attach to a persistent microVM (create if needed)",
+	Short: "Start or attach to the workspace's microVM (create if needed)",
 	RunE:  runUp,
+}
+
+var destroyCmd = &cobra.Command{
+	Use:   "destroy",
+	Short: "Stop and remove the workspace's microVM",
+	RunE:  runDestroy,
 }
 
 var snapshotCmd = &cobra.Command{
@@ -176,7 +182,7 @@ func init() {
 		cmd.Flags().IntVar(&flagCPUs, "cpus", 0, "number of CPUs")
 	}
 
-	for _, cmd := range []*cobra.Command{runCmd, createCmd, shellCmd, upCmd} {
+	for _, cmd := range []*cobra.Command{runCmd, createCmd, shellCmd} {
 		cmd.Flags().StringVar(&flagName, "name", "", "name for the VM")
 	}
 
@@ -195,6 +201,7 @@ func init() {
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(buildCmd)
 	rootCmd.AddCommand(upCmd)
+	rootCmd.AddCommand(destroyCmd)
 	rootCmd.AddCommand(snapshotCmd)
 	snapshotCmd.AddCommand(snapshotCreateCmd)
 	snapshotCmd.AddCommand(snapshotRestoreCmd)
@@ -273,48 +280,54 @@ func runUp(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	store, err := state.NewStore()
+	if err != nil {
+		return fmt.Errorf("state store: %w", err)
+	}
+
+	foreground := !flagDetach
+
+	vmState, err := store.LookupByWorkspace(workDir)
+	if err != nil {
+		return fmt.Errorf("lookup workspace VM: %w", err)
+	}
+
+	if vmState != nil {
+		switch vmState.Status {
+		case state.StatusRunning:
+			if flagDetach {
+				fmt.Printf("VM %s is already running (workspace: %s)\n", vmState.ID, workDir)
+				return nil
+			}
+			fmt.Printf("Re-attaching to running VM %s...\n", vmState.ID)
+			return qemu.AttachConsole(vmState.ConsolePath)
+
+		case state.StatusCreated, state.StatusStopped:
+			mgr, err := createManager(cfg, workDir)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Starting VM %s...\n", vmState.ID)
+			exitCode, err := mgr.Start(context.Background(), vmState.ID, foreground)
+			if err != nil {
+				return err
+			}
+			if flagDetach {
+				fmt.Printf("VM %s started in background\n", vmState.ID)
+				return nil
+			}
+			os.Exit(exitCode)
+			return nil
+		}
+	}
+
+	// No workspace VM found — create and start a new one.
 	mgr, err := createManager(cfg, workDir)
 	if err != nil {
 		return err
 	}
 
-	foreground := !flagDetach
-
-	if flagName != "" {
-		store, err := state.NewStore()
-		if err != nil {
-			return fmt.Errorf("state store: %w", err)
-		}
-		vmState, lookupErr := store.Lookup(flagName)
-		if lookupErr == nil {
-			switch vmState.Status {
-			case state.StatusRunning:
-				if flagDetach {
-					fmt.Printf("VM %q is already running (%s)\n", flagName, vmState.ID)
-					return nil
-				}
-				fmt.Printf("Re-attaching to running VM %q (%s)...\n", flagName, vmState.ID)
-				return qemu.AttachConsole(vmState.ConsolePath)
-			case state.StatusCreated, state.StatusStopped:
-				fmt.Printf("Starting VM %q (%s)...\n", flagName, vmState.ID)
-				exitCode, err := mgr.Start(context.Background(), vmState.ID, foreground)
-				if err != nil {
-					return err
-				}
-				if flagDetach {
-					fmt.Printf("VM %q started in background\n", flagName)
-					return nil
-				}
-				os.Exit(exitCode)
-				return nil
-			}
-		}
-		// VM doesn't exist — fall through to create + start
-	}
-
-	// Create + start (named or anonymous)
-	vmState, err := mgr.Create(context.Background(), vm.CreateOpts{
-		Name:    flagName,
+	vmState, err = mgr.Create(context.Background(), vm.CreateOpts{
 		Command: "/bin/sh",
 	})
 	if err != nil {
@@ -328,11 +341,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 	}
 
 	if flagDetach {
-		if flagName != "" {
-			fmt.Printf("VM %q started in background (%s)\n", flagName, vmState.ID)
-		} else {
-			fmt.Printf("VM %s started in background\n", vmState.ID)
-		}
+		fmt.Printf("VM %s started in background (workspace: %s)\n", vmState.ID, workDir)
 		return nil
 	}
 
@@ -409,11 +418,29 @@ func runStop(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if err := mgr.Stop(context.Background(), args[0]); err != nil {
+	targetID := ""
+	if len(args) == 1 {
+		targetID = args[0]
+	} else {
+		store, err := state.NewStore()
+		if err != nil {
+			return fmt.Errorf("state store: %w", err)
+		}
+		vmState, err := store.LookupByWorkspace(workDir)
+		if err != nil {
+			return fmt.Errorf("lookup workspace VM: %w", err)
+		}
+		if vmState == nil {
+			return fmt.Errorf("no VM found for workspace %s", workDir)
+		}
+		targetID = vmState.ID
+	}
+
+	if err := mgr.Stop(context.Background(), targetID); err != nil {
 		return err
 	}
 
-	fmt.Printf("Stopped %s\n", args[0])
+	fmt.Printf("Stopped %s\n", targetID)
 	return nil
 }
 
@@ -428,12 +455,62 @@ func runAttach(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	consolePath, err := mgr.ConsolePath(args[0])
+	targetID := ""
+	if len(args) == 1 {
+		targetID = args[0]
+	} else {
+		store, err := state.NewStore()
+		if err != nil {
+			return fmt.Errorf("state store: %w", err)
+		}
+		vmState, err := store.LookupByWorkspace(workDir)
+		if err != nil {
+			return fmt.Errorf("lookup workspace VM: %w", err)
+		}
+		if vmState == nil {
+			return fmt.Errorf("no VM found for workspace %s", workDir)
+		}
+		targetID = vmState.ID
+	}
+
+	consolePath, err := mgr.ConsolePath(targetID)
 	if err != nil {
 		return err
 	}
 
 	return qemu.AttachConsole(consolePath)
+}
+
+func runDestroy(cmd *cobra.Command, args []string) error {
+	cfg, workDir, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	store, err := state.NewStore()
+	if err != nil {
+		return fmt.Errorf("state store: %w", err)
+	}
+
+	vmState, err := store.LookupByWorkspace(workDir)
+	if err != nil {
+		return fmt.Errorf("lookup workspace VM: %w", err)
+	}
+	if vmState == nil {
+		return fmt.Errorf("no VM found for workspace %s", workDir)
+	}
+
+	mgr, err := createManager(cfg, workDir)
+	if err != nil {
+		return err
+	}
+
+	if err := mgr.Remove(context.Background(), vmState.ID, true); err != nil {
+		return err
+	}
+
+	fmt.Printf("Destroyed VM %s (workspace: %s)\n", vmState.ID, workDir)
+	return nil
 }
 
 func runRm(cmd *cobra.Command, args []string) error {
@@ -467,7 +544,7 @@ func runPs(cmd *cobra.Command, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tNAME\tSTATUS\tCREATED\tIMAGE\tCOMMAND")
+	fmt.Fprintln(w, "ID\tNAME\tSTATUS\tCREATED\tIMAGE\tCOMMAND\tWORKSPACE")
 	for _, v := range vms {
 		name := v.Name
 		if name == "" {
@@ -477,8 +554,12 @@ func runPs(cmd *cobra.Command, args []string) error {
 		if command == "" {
 			command = "-"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			v.ID, name, v.Status, relativeTime(v.CreatedAt), v.Image, command)
+		workspace := v.Workspace.HostDir
+		if workspace == "" {
+			workspace = "-"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			v.ID, name, v.Status, relativeTime(v.CreatedAt), v.Image, command, workspace)
 	}
 	w.Flush()
 	return nil
