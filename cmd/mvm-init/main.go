@@ -27,6 +27,204 @@ const (
 	servicesConfigPath = "/etc/mvm/services.ini"
 )
 
+type pkgManager int
+
+const (
+	pkgManagerUnknown  pkgManager = iota
+	pkgManagerApk                 // Alpine
+	pkgManagerAptGet              // Debian/Ubuntu
+	pkgManagerDnf                 // Fedora/RHEL
+	pkgManagerMicrodnf            // ubi/minimal Fedora
+	pkgManagerPacman              // Arch
+	pkgManagerEmerge              // Gentoo
+)
+
+// pmPaths lists candidate absolute paths for each package manager binary.
+// We probe absolute paths instead of using exec.LookPath because $PATH is
+// empty (or minimal) when mvm-init runs as PID 1 at boot.
+var pmPaths = []struct {
+	paths []string
+	pm    pkgManager
+}{
+	{[]string{"/sbin/apk", "/usr/bin/apk"}, pkgManagerApk},
+	{[]string{"/usr/bin/apt-get", "/bin/apt-get"}, pkgManagerAptGet},
+	{[]string{"/usr/bin/dnf", "/bin/dnf"}, pkgManagerDnf},
+	{[]string{"/usr/bin/microdnf", "/bin/microdnf"}, pkgManagerMicrodnf},
+	{[]string{"/usr/bin/pacman", "/bin/pacman"}, pkgManagerPacman},
+	{[]string{"/usr/bin/emerge"}, pkgManagerEmerge},
+}
+
+func detectPackageManager() pkgManager {
+	for _, candidate := range pmPaths {
+		for _, p := range candidate.paths {
+			if _, err := os.Stat(p); err == nil {
+				return candidate.pm
+			}
+		}
+	}
+	return pkgManagerUnknown
+}
+
+// pmBinPath returns the absolute path to the package manager binary.
+func pmBinPath(pm pkgManager) string {
+	for _, candidate := range pmPaths {
+		if candidate.pm == pm {
+			for _, p := range candidate.paths {
+				if _, err := os.Stat(p); err == nil {
+					return p
+				}
+			}
+		}
+	}
+	return pm.String() // fallback, will likely fail
+}
+
+func (pm pkgManager) String() string {
+	switch pm {
+	case pkgManagerApk:
+		return "apk"
+	case pkgManagerAptGet:
+		return "apt-get"
+	case pkgManagerDnf:
+		return "dnf"
+	case pkgManagerMicrodnf:
+		return "microdnf"
+	case pkgManagerPacman:
+		return "pacman"
+	case pkgManagerEmerge:
+		return "emerge"
+	default:
+		return "unknown"
+	}
+}
+
+// userShell returns the shell basename passed via mvm.shell, falling back to
+// bash. ash is remapped to bash since it is bundled with busybox and not
+// independently installable.
+func userShell(mvmShell string) string {
+	sh := filepath.Base(mvmShell)
+	if sh == "" || sh == "." || sh == "ash" {
+		return "bash"
+	}
+	return sh
+}
+
+// pkgNames maps a canonical tool name to the distro-specific package name.
+var pkgNames = map[pkgManager]map[string]string{
+	pkgManagerApk: {
+		"shadow":     "shadow",
+		"sudo":       "sudo",
+		"findutils":  "findutils",
+		"util-linux": "util-linux",
+		"curl":       "curl",
+		"wget":       "wget",
+		"procps":     "procps-ng",
+	},
+	pkgManagerAptGet: {
+		"shadow":     "passwd",
+		"sudo":       "sudo",
+		"findutils":  "findutils",
+		"util-linux": "util-linux",
+		"curl":       "curl",
+		"wget":       "wget",
+		"procps":     "procps",
+	},
+	pkgManagerDnf: {
+		"shadow":     "shadow-utils",
+		"sudo":       "sudo",
+		"findutils":  "findutils",
+		"util-linux": "util-linux",
+		"curl":       "curl",
+		"wget":       "wget",
+		"procps":     "procps-ng",
+	},
+	pkgManagerMicrodnf: {
+		"shadow":     "shadow-utils",
+		"sudo":       "sudo",
+		"findutils":  "findutils",
+		"util-linux": "util-linux",
+		"curl":       "curl",
+		"wget":       "wget",
+		"procps":     "procps-ng",
+	},
+	pkgManagerPacman: {
+		"shadow":     "shadow",
+		"sudo":       "sudo",
+		"findutils":  "findutils",
+		"util-linux": "util-linux",
+		"curl":       "curl",
+		"wget":       "wget",
+		"procps":     "procps-ng",
+	},
+	pkgManagerEmerge: {
+		"shadow":     "sys-apps/shadow",
+		"sudo":       "app-admin/sudo",
+		"findutils":  "sys-apps/findutils",
+		"util-linux": "sys-apps/util-linux",
+		"curl":       "net-misc/curl",
+		"wget":       "net-misc/wget",
+		"procps":     "sys-process/procps",
+	},
+}
+
+// installPackages runs the package manager to install the given packages,
+// streaming output to stderr.
+func installPackages(pm pkgManager, pkgs []string) error {
+	var args []string
+	switch pm {
+	case pkgManagerApk:
+		args = append([]string{"add", "--force-overwrite"}, pkgs...)
+	case pkgManagerAptGet:
+		args = append([]string{"install", "-y"}, pkgs...)
+	case pkgManagerDnf:
+		args = append([]string{"install", "-y", "--allowerasing"}, pkgs...)
+	case pkgManagerMicrodnf:
+		args = append([]string{"install", "-y"}, pkgs...)
+	case pkgManagerPacman:
+		args = append([]string{"-S", "--needed", "--noconfirm"}, pkgs...)
+	case pkgManagerEmerge:
+		args = append([]string{"--ask=n", "--autounmask-continue", "--noreplace", "--quiet-build"}, pkgs...)
+	default:
+		return fmt.Errorf("unsupported package manager")
+	}
+	cmd := exec.Command(pmBinPath(pm), args...)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// installShellAndTools installs the user's shell (with bash fallback) and a
+// minimal set of host tools using the detected package manager.
+func installShellAndTools(pm pkgManager, shell string) error {
+	names := pkgNames[pm]
+
+	// Install the user's shell first; fall back to bash on failure.
+	if err := installPackages(pm, []string{shell}); err != nil {
+		fmt.Fprintf(os.Stderr, "[mvm] could not install %s, falling back to bash\n", shell)
+		shell = "bash"
+		if err := installPackages(pm, []string{shell}); err != nil {
+			return fmt.Errorf("install shell: %w", err)
+		}
+	}
+
+	// Build the list of tool packages for this distro.
+	tools := []string{"shadow", "sudo", "findutils", "util-linux", "curl", "wget", "procps"}
+	var pkgs []string
+	for _, t := range tools {
+		if n, ok := names[t]; ok {
+			pkgs = append(pkgs, n)
+		}
+	}
+
+	if len(pkgs) > 0 {
+		if err := installPackages(pm, pkgs); err != nil {
+			return fmt.Errorf("install tools: %w", err)
+		}
+	}
+
+	return nil
+}
+
 func init() {
 	go func() {
 		c := make(chan os.Signal, 32)
@@ -68,6 +266,7 @@ func run() error {
 	mvmUID := params["mvm.uid"]
 	mvmWS := params["mvm.ws"]
 	mvmHostname := params["mvm.hostname"]
+	mvmShell := params["mvm.shell"]
 	mvmEnv := decodeEnv(params["mvm.env"])
 	mvmMounts := decodeMounts(params["mvm.mounts"])
 	mvmUsers := decodeUsers(params["mvm.users"])
@@ -102,6 +301,17 @@ func run() error {
 	}
 
 	setupNetworking()
+
+	pm := detectPackageManager()
+	shell := userShell(mvmShell)
+	if pm != pkgManagerUnknown {
+		fmt.Fprintf(os.Stderr, "[mvm] installing host tools (%s)...\n", pm)
+		if err := installShellAndTools(pm, shell); err != nil {
+			fmt.Fprintf(os.Stderr, "[mvm] host tools install failed: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "[mvm] host tools installed\n")
+		}
+	}
 
 	ctrl := openCtrl()
 

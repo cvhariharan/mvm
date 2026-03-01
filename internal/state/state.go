@@ -48,6 +48,7 @@ type VMState struct {
 	Env         map[string]string `json:"env,omitempty"`
 	Command     string            `json:"command,omitempty"`
 	UID         string            `json:"uid"`
+	Shell       string            `json:"shell,omitempty"`
 	Users       []UserState       `json:"users,omitempty"`
 }
 

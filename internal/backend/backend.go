@@ -18,6 +18,7 @@ type VMConfig struct {
 	Command     string
 	UID         string
 	Hostname    string
+	Shell       string
 	CtrlSocket  string
 	Users       []User
 }

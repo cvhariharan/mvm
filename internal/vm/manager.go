@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -112,6 +113,7 @@ func (m *Manager) Create(ctx context.Context, opts CreateOpts) (*state.VMState, 
 		CPUs:    m.cfg.VM.CPUs,
 		Command: opts.Command,
 		UID:     uid,
+		Shell:   filepath.Base(os.Getenv("SHELL")),
 		Network: state.NetworkState{
 			Mode: m.cfg.Network.Mode,
 			DNS:  m.cfg.Network.DNS,
@@ -451,6 +453,7 @@ func stateToVMConfig(s *state.VMState) *backend.VMConfig {
 		Env:         s.Env,
 		Command:     s.Command,
 		UID:         s.UID,
+		Shell:       s.Shell,
 		Hostname:    s.Hostname(),
 		Users:       stateUsersToBackend(s.Users),
 	}

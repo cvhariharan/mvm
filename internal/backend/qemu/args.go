@@ -89,6 +89,9 @@ func buildCmdline(cfg *backend.VMConfig) string {
 	if cfg.Hostname != "" {
 		parts = append(parts, "mvm.hostname="+cfg.Hostname)
 	}
+	if cfg.Shell != "" {
+		parts = append(parts, "mvm.shell="+cfg.Shell)
+	}
 	if cfg.Workspace.GuestDir != "" {
 		parts = append(parts, "mvm.ws="+cfg.Workspace.GuestDir)
 	}
