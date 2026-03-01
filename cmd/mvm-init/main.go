@@ -327,9 +327,9 @@ func run() error {
 	// Run initial workload
 	exitCode := 0
 	if mvmCmd != "" {
-		exitCode = runWorkload(mvmCmd, mvmEnv, mvmUID, mvmUsers)
+		exitCode = runWorkload(mvmCmd, mvmEnv, mvmUID, mvmUsers, mvmWS)
 	} else {
-		exitCode = runWorkload("/bin/sh", mvmEnv, mvmUID, mvmUsers)
+		exitCode = runWorkload(resolveShellPath(shell), mvmEnv, mvmUID, mvmUsers, mvmWS)
 	}
 	sendMsg(ctrl, proto.Message{Type: proto.TypeExit, Payload: mustJSON(proto.ExitPayload{Code: exitCode})})
 
@@ -338,7 +338,7 @@ func run() error {
 		// No ctrl channel — respawn a shell each time it exits.
 		// The VM stays alive until QEMU is killed externally (mvm stop).
 		for {
-			runWorkload("/bin/sh", mvmEnv, mvmUID, mvmUsers)
+			runWorkload(resolveShellPath(shell), mvmEnv, mvmUID, mvmUsers, mvmWS)
 		}
 	}
 
@@ -355,7 +355,7 @@ func run() error {
 			for k, v := range p.Env {
 				mvmEnv[k] = v
 			}
-			code := runWorkload(p.Cmd, mvmEnv, mvmUID, mvmUsers)
+			code := runWorkload(p.Cmd, mvmEnv, mvmUID, mvmUsers, "")
 			sendMsg(ctrl, proto.Message{Type: proto.TypeExit, Payload: mustJSON(proto.ExitPayload{Code: code})})
 		}
 	}
@@ -367,7 +367,19 @@ func run() error {
 	return nil
 }
 
-func runWorkload(cmd string, env map[string]string, uidGid string, users []user) int {
+// resolveShellPath returns the full path for a shell basename by probing
+// standard bin directories. Falls back to /bin/sh if not found.
+func resolveShellPath(shell string) string {
+	for _, dir := range []string{"/bin", "/usr/bin", "/usr/local/bin"} {
+		p := filepath.Join(dir, shell)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return "/bin/sh"
+}
+
+func runWorkload(cmd string, env map[string]string, uidGid string, users []user, workdir string) int {
 	parts := strings.Fields(cmd)
 	if len(parts) == 0 {
 		return 0
@@ -379,7 +391,7 @@ func runWorkload(cmd string, env map[string]string, uidGid string, users []user)
 	if err != nil {
 		// Fall back to direct I/O if PTY allocation fails.
 		fmt.Fprintf(os.Stderr, "mvm-init: pty open failed (%v), running without pty\n", err)
-		return runWorkloadNoPTY(parts, env, uidGid, users)
+		return runWorkloadNoPTY(parts, env, uidGid, users, workdir)
 	}
 	c := exec.Command(parts[0], parts[1:]...)
 	c.Stdin = pts
@@ -402,12 +414,19 @@ func runWorkload(cmd string, env map[string]string, uidGid string, users []user)
 			if u.UID == uid {
 				overrides["USER"] = u.Name
 				overrides["HOME"] = "/home/" + u.Name
-				c.Dir = "/home/" + u.Name
+				if workdir != "" {
+					c.Dir = workdir
+				} else {
+					c.Dir = "/home/" + u.Name
+				}
 				break
 			}
 		}
 		c.Env = buildEnv(overrides)
 	} else {
+		if workdir != "" {
+			c.Dir = workdir
+		}
 		c.Env = buildEnv(env)
 	}
 
@@ -552,7 +571,7 @@ func setCooked(fd uintptr) error {
 }
 
 // runWorkloadNoPTY is a fallback that runs the command without a PTY.
-func runWorkloadNoPTY(parts []string, env map[string]string, uidGid string, users []user) int {
+func runWorkloadNoPTY(parts []string, env map[string]string, uidGid string, users []user, workdir string) int {
 	c := exec.Command(parts[0], parts[1:]...)
 	c.Stdin = os.Stdin
 	c.Stdout = os.Stdout
@@ -570,12 +589,19 @@ func runWorkloadNoPTY(parts []string, env map[string]string, uidGid string, user
 			if u.UID == uid {
 				overrides["USER"] = u.Name
 				overrides["HOME"] = "/home/" + u.Name
-				c.Dir = "/home/" + u.Name
+				if workdir != "" {
+					c.Dir = workdir
+				} else {
+					c.Dir = "/home/" + u.Name
+				}
 				break
 			}
 		}
 		c.Env = buildEnv(overrides)
 	} else {
+		if workdir != "" {
+			c.Dir = workdir
+		}
 		c.Env = buildEnv(env)
 	}
 	if err := c.Run(); err != nil {
@@ -600,7 +626,7 @@ func waitForExec(ctrl io.ReadWriteCloser, env map[string]string, uidGid string, 
 			for k, v := range p.Env {
 				env[k] = v
 			}
-			return runWorkload(p.Cmd, env, uidGid, users)
+			return runWorkload(p.Cmd, env, uidGid, users, "")
 		}
 	}
 }
