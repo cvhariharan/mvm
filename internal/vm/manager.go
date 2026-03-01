@@ -115,8 +115,9 @@ func (m *Manager) Create(ctx context.Context, opts CreateOpts) (*state.VMState, 
 		UID:     uid,
 		Shell:   filepath.Base(os.Getenv("SHELL")),
 		Network: state.NetworkState{
-			Mode: m.cfg.Network.Mode,
-			DNS:  m.cfg.Network.DNS,
+			Mode:  m.cfg.Network.Mode,
+			DNS:   m.cfg.Network.DNS,
+			Ports: configPortsToState(m.cfg.Network.Ports),
 		},
 		Workspace: func() state.WorkspaceState {
 			if m.cfg.Mounts.MountWorkspace {
@@ -442,8 +443,9 @@ func stateToVMConfig(s *state.VMState) *backend.VMConfig {
 		Memory:      s.Memory,
 		CPUs:        s.CPUs,
 		Network: backend.NetworkConfig{
-			Mode: s.Network.Mode,
-			DNS:  s.Network.DNS,
+			Mode:  s.Network.Mode,
+			DNS:   s.Network.DNS,
+			Ports: statePortsToBackend(s.Network.Ports),
 		},
 		Workspace: backend.WorkspaceConfig{
 			HostDir:  s.Workspace.HostDir,
@@ -457,6 +459,22 @@ func stateToVMConfig(s *state.VMState) *backend.VMConfig {
 		Hostname:    s.Hostname(),
 		Users:       stateUsersToBackend(s.Users),
 	}
+}
+
+func configPortsToState(ports []config.PortForward) []state.PortForwardState {
+	out := make([]state.PortForwardState, len(ports))
+	for i, p := range ports {
+		out[i] = state.PortForwardState{Host: p.Host, Guest: p.Guest, Protocol: p.Protocol}
+	}
+	return out
+}
+
+func statePortsToBackend(ports []state.PortForwardState) []backend.PortForward {
+	out := make([]backend.PortForward, len(ports))
+	for i, p := range ports {
+		out[i] = backend.PortForward{Host: p.Host, Guest: p.Guest, Protocol: p.Protocol}
+	}
+	return out
 }
 
 func stateUsersToBackend(users []state.UserState) []backend.User {

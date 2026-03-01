@@ -373,16 +373,27 @@ func runWorkload(cmd string, env map[string]string, uidGid string, users []user)
 		return 0
 	}
 
+	// Open a PTY master so the child gets a proper controlling terminal.
+	// This enables job control and correct signal delivery (e.g. Ctrl+C → SIGINT).
+	ptm, pts, err := openPTY()
+	if err != nil {
+		// Fall back to direct I/O if PTY allocation fails.
+		fmt.Fprintf(os.Stderr, "mvm-init: pty open failed (%v), running without pty\n", err)
+		return runWorkloadNoPTY(parts, env, uidGid, users)
+	}
 	c := exec.Command(parts[0], parts[1:]...)
-	c.Stdin = os.Stdin
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
+	c.Stdin = pts
+	c.Stdout = pts
+	c.Stderr = pts
+	c.SysProcAttr = &syscall.SysProcAttr{
+		Setsid:  true,
+		Setctty: true,
+		Ctty:    0, // stdin (fd 0) is pts; TIOCSCTTY is called on it after setsid
+	}
+
 	if uidGid != "" {
 		uid, gid := parseUIDGID(uidGid)
-		c.SysProcAttr = &syscall.SysProcAttr{
-			Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)},
-		}
-		// Build env with HOME and USER overridden for the workload user.
+		c.SysProcAttr.Credential = &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}
 		overrides := map[string]string{}
 		for k, v := range env {
 			overrides[k] = v
@@ -400,6 +411,173 @@ func runWorkload(cmd string, env map[string]string, uidGid string, users []user)
 		c.Env = buildEnv(env)
 	}
 
+	if err := c.Start(); err != nil {
+		pts.Close()
+		ptm.Close()
+		fmt.Fprintf(os.Stderr, "mvm-init: start %s: %v\n", parts[0], err)
+		return 1
+	}
+	// Close slave side in parent after child inherits it.
+	pts.Close()
+
+	// Put ttyS0 into raw mode so bytes like ^C (0x03) are passed through
+	// as-is to the PTY master, which will then deliver SIGINT to the child.
+	if err := setRaw(os.Stdin.Fd()); err != nil {
+		fmt.Fprintf(os.Stderr, "mvm-init: setraw ttyS0: %v\n", err)
+	}
+
+	// Bridge ttyS0 (os.Stdin/Stdout) ↔ PTY master concurrently.
+	done := make(chan struct{}, 2)
+	go func() {
+		io.Copy(ptm, os.Stdin)
+		done <- struct{}{}
+	}()
+	go func() {
+		io.Copy(os.Stdout, ptm)
+		done <- struct{}{}
+	}()
+
+	err = c.Wait()
+	// Signal bridge goroutines to stop by closing the master.
+	ptm.Close()
+	<-done
+	<-done
+
+	// Restore ttyS0 to cooked mode for any subsequent workload.
+	setCooked(os.Stdin.Fd())
+
+	if err != nil {
+		if exit, ok := err.(*exec.ExitError); ok {
+			return exit.ExitCode()
+		}
+		return 1
+	}
+	return 0
+}
+
+// openPTY opens a PTY master/slave pair and returns (master, slave, error).
+func openPTY() (*os.File, *os.File, error) {
+	ptm, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open /dev/ptmx: %w", err)
+	}
+
+	// grantpt: not strictly needed on Linux with devtmpfs but call for correctness.
+	if err := grantpt(ptm); err != nil {
+		ptm.Close()
+		return nil, nil, fmt.Errorf("grantpt: %w", err)
+	}
+	// unlockpt: remove the internal lock so the slave can be opened.
+	if err := unlockpt(ptm); err != nil {
+		ptm.Close()
+		return nil, nil, fmt.Errorf("unlockpt: %w", err)
+	}
+
+	slaveName, err := ptsname(ptm)
+	if err != nil {
+		ptm.Close()
+		return nil, nil, fmt.Errorf("ptsname: %w", err)
+	}
+
+	pts, err := os.OpenFile(slaveName, os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		ptm.Close()
+		return nil, nil, fmt.Errorf("open slave %s: %w", slaveName, err)
+	}
+	return ptm, pts, nil
+}
+
+func grantpt(f *os.File) error {
+	// On Linux this is a no-op; the kernel handles permissions automatically.
+	return nil
+}
+
+func unlockpt(f *os.File) error {
+	var n int32 // unlock value = 0
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), syscall.TIOCSPTLCK, uintptr(unsafe.Pointer(&n)))
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func ptsname(f *os.File) (string, error) {
+	var n uint32
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), syscall.TIOCGPTN, uintptr(unsafe.Pointer(&n)))
+	if errno != 0 {
+		return "", errno
+	}
+	return fmt.Sprintf("/dev/pts/%d", n), nil
+}
+
+// setRaw puts a terminal fd into raw mode (no signal generation, no echo,
+// no line buffering) so that bytes like ^C pass through to the PTY master.
+func setRaw(fd uintptr) error {
+	var t syscall.Termios
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, syscall.TCGETS, uintptr(unsafe.Pointer(&t))); errno != 0 {
+		return errno
+	}
+	// Clear input flags that process special characters.
+	t.Iflag &^= syscall.IGNBRK | syscall.BRKINT | syscall.PARMRK | syscall.ISTRIP |
+		syscall.INLCR | syscall.IGNCR | syscall.ICRNL | syscall.IXON
+	// Disable output processing.
+	t.Oflag &^= syscall.OPOST
+	// Disable echo and canonical mode; disable signal generation.
+	t.Lflag &^= syscall.ECHO | syscall.ECHONL | syscall.ICANON | syscall.ISIG | syscall.IEXTEN
+	// Clear character size mask and set 8 bits.
+	t.Cflag &^= syscall.CSIZE | syscall.PARENB
+	t.Cflag |= syscall.CS8
+	// Read returns after 1 byte, no timeout.
+	t.Cc[syscall.VMIN] = 1
+	t.Cc[syscall.VTIME] = 0
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, syscall.TCSETS, uintptr(unsafe.Pointer(&t))); errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// setCooked restores a terminal fd to canonical (cooked) mode.
+func setCooked(fd uintptr) error {
+	var t syscall.Termios
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, syscall.TCGETS, uintptr(unsafe.Pointer(&t))); errno != 0 {
+		return errno
+	}
+	t.Iflag |= syscall.ICRNL | syscall.IXON
+	t.Oflag |= syscall.OPOST
+	t.Lflag |= syscall.ECHO | syscall.ECHONL | syscall.ICANON | syscall.ISIG | syscall.IEXTEN
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, syscall.TCSETS, uintptr(unsafe.Pointer(&t))); errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// runWorkloadNoPTY is a fallback that runs the command without a PTY.
+func runWorkloadNoPTY(parts []string, env map[string]string, uidGid string, users []user) int {
+	c := exec.Command(parts[0], parts[1:]...)
+	c.Stdin = os.Stdin
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+	if uidGid != "" {
+		uid, gid := parseUIDGID(uidGid)
+		c.SysProcAttr = &syscall.SysProcAttr{
+			Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)},
+		}
+		overrides := map[string]string{}
+		for k, v := range env {
+			overrides[k] = v
+		}
+		for _, u := range users {
+			if u.UID == uid {
+				overrides["USER"] = u.Name
+				overrides["HOME"] = "/home/" + u.Name
+				c.Dir = "/home/" + u.Name
+				break
+			}
+		}
+		c.Env = buildEnv(overrides)
+	} else {
+		c.Env = buildEnv(env)
+	}
 	if err := c.Run(); err != nil {
 		if exit, ok := err.(*exec.ExitError); ok {
 			return exit.ExitCode()

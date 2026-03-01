@@ -42,8 +42,16 @@ func buildArgs(cfg *backend.VMConfig, vm *backend.VM) []string {
 
 	// Network
 	if cfg.Network.Mode == "slirp" {
+		netdev := "user,id=net0"
+		for _, pf := range cfg.Network.Ports {
+			proto := pf.Protocol
+			if proto == "" {
+				proto = "tcp"
+			}
+			netdev += fmt.Sprintf(",hostfwd=%s::%d-:%d", proto, pf.Host, pf.Guest)
+		}
 		args = append(args,
-			"-netdev", "user,id=net0",
+			"-netdev", netdev,
 			"-device", "virtio-net-device,netdev=net0",
 		)
 	}

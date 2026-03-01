@@ -37,8 +37,15 @@ type Mount struct {
 }
 
 type NetworkConfig struct {
-	Mode string // "slirp" or "none"
-	DNS  string
+	Mode  string        // "slirp" or "none"
+	DNS   string
+	Ports []PortForward
+}
+
+type PortForward struct {
+	Host     int
+	Guest    int
+	Protocol string // "tcp" or "udp"; defaults to "tcp" if empty
 }
 
 type WorkspaceConfig struct {

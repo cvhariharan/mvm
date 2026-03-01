@@ -45,8 +45,15 @@ type VMConfig struct {
 }
 
 type NetworkConfig struct {
-	Mode string `koanf:"mode"`
-	DNS  string `koanf:"dns"`
+	Mode  string        `koanf:"mode"`
+	DNS   string        `koanf:"dns"`
+	Ports []PortForward `koanf:"ports"`
+}
+
+type PortForward struct {
+	Host     int    `koanf:"host"`
+	Guest    int    `koanf:"guest"`
+	Protocol string `koanf:"protocol"`
 }
 
 type MountConfig struct {
@@ -124,6 +131,10 @@ cpus = 2
 
 [network]
 mode = "slirp"
+# [[network.ports]]
+# host = 8080
+# guest = 80
+# protocol = "tcp"  # optional, defaults to "tcp"
 
 [mounts]
 mount_workspace = true

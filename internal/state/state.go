@@ -66,8 +66,15 @@ type MountState struct {
 }
 
 type NetworkState struct {
-	Mode string `json:"mode"`
-	DNS  string `json:"dns"`
+	Mode  string             `json:"mode"`
+	DNS   string             `json:"dns"`
+	Ports []PortForwardState `json:"ports,omitempty"`
+}
+
+type PortForwardState struct {
+	Host     int    `json:"host"`
+	Guest    int    `json:"guest"`
+	Protocol string `json:"protocol,omitempty"`
 }
 
 type WorkspaceState struct {
