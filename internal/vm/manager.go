@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/user"
 	"strconv"
 	"syscall"
@@ -268,6 +269,84 @@ func (m *Manager) Remove(ctx context.Context, id string, force bool) error {
 // List returns all VMs.
 func (m *Manager) List() ([]*state.VMState, error) {
 	return m.store.List()
+}
+
+// Snapshot creates an internal snapshot of the VM's qcow2 overlay.
+func (m *Manager) Snapshot(ctx context.Context, id, name string) error {
+	vmState, err := m.store.Lookup(id)
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, "qemu-img", "snapshot", "-c", name, vmState.OverlayPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("snapshot: %s: %w", out, err)
+	}
+	return nil
+}
+
+// RestoreSnapshot reverts the VM's qcow2 overlay to a named snapshot.
+// The VM must be stopped.
+func (m *Manager) RestoreSnapshot(ctx context.Context, id, name string) error {
+	vmState, err := m.store.Lookup(id)
+	if err != nil {
+		return err
+	}
+	if vmState.Status == state.StatusRunning {
+		return fmt.Errorf("vm %s is running; stop it before restoring a snapshot", vmState.ID)
+	}
+	cmd := exec.CommandContext(ctx, "qemu-img", "snapshot", "-a", name, vmState.OverlayPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("restore snapshot: %s: %w", out, err)
+	}
+	return nil
+}
+
+// ListSnapshots lists the internal snapshots of the VM's qcow2 overlay.
+func (m *Manager) ListSnapshots(ctx context.Context, id string) (string, error) {
+	vmState, err := m.store.Lookup(id)
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.CommandContext(ctx, "qemu-img", "snapshot", "-l", vmState.OverlayPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("list snapshots: %s: %w", out, err)
+	}
+	return string(out), nil
+}
+
+// DeleteSnapshot deletes a named internal snapshot from the VM's qcow2 overlay.
+// The VM must be stopped.
+func (m *Manager) DeleteSnapshot(ctx context.Context, id, name string) error {
+	vmState, err := m.store.Lookup(id)
+	if err != nil {
+		return err
+	}
+	if vmState.Status == state.StatusRunning {
+		return fmt.Errorf("vm %s is running; stop it before deleting a snapshot", vmState.ID)
+	}
+	cmd := exec.CommandContext(ctx, "qemu-img", "snapshot", "-d", name, vmState.OverlayPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("delete snapshot: %s: %w", out, err)
+	}
+	return nil
+}
+
+// Resize changes the size of the VM's qcow2 overlay disk.
+// The VM must be stopped. Size is a qemu-img size string e.g. "10G", "+5G".
+func (m *Manager) Resize(ctx context.Context, id, size string) error {
+	vmState, err := m.store.Lookup(id)
+	if err != nil {
+		return err
+	}
+	if vmState.Status == state.StatusRunning {
+		return fmt.Errorf("vm %s is running; stop it before resizing", vmState.ID)
+	}
+	cmd := exec.CommandContext(ctx, "qemu-img", "resize", vmState.OverlayPath, size)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("resize: %s: %w", out, err)
+	}
+	return nil
 }
 
 // Run is the ephemeral shortcut: create, start, attach console, wait for

@@ -111,6 +111,46 @@ var upCmd = &cobra.Command{
 	RunE:  runUp,
 }
 
+var snapshotCmd = &cobra.Command{
+	Use:   "snapshot",
+	Short: "Snapshot management commands",
+}
+
+var snapshotCreateCmd = &cobra.Command{
+	Use:   "create <id-or-name> <snapshot-name>",
+	Short: "Create a snapshot of a microVM's disk",
+	Args:  cobra.ExactArgs(2),
+	RunE:  runSnapshotCreate,
+}
+
+var snapshotRestoreCmd = &cobra.Command{
+	Use:   "restore <id-or-name> <snapshot-name>",
+	Short: "Restore a microVM's disk to a snapshot (VM must be stopped)",
+	Args:  cobra.ExactArgs(2),
+	RunE:  runSnapshotRestore,
+}
+
+var snapshotListCmd = &cobra.Command{
+	Use:   "list <id-or-name>",
+	Short: "List snapshots of a microVM's disk",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runSnapshotList,
+}
+
+var snapshotDeleteCmd = &cobra.Command{
+	Use:   "delete <id-or-name> <snapshot-name>",
+	Short: "Delete a snapshot from a microVM's disk (VM must be stopped)",
+	Args:  cobra.ExactArgs(2),
+	RunE:  runSnapshotDelete,
+}
+
+var resizeCmd = &cobra.Command{
+	Use:   "resize <id-or-name> <size>",
+	Short: "Resize a microVM's disk (VM must be stopped, e.g. 10G or +5G)",
+	Args:  cobra.ExactArgs(2),
+	RunE:  runResize,
+}
+
 var kernelCmd = &cobra.Command{
 	Use:   "kernel",
 	Short: "Kernel management commands",
@@ -155,6 +195,12 @@ func init() {
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(buildCmd)
 	rootCmd.AddCommand(upCmd)
+	rootCmd.AddCommand(snapshotCmd)
+	snapshotCmd.AddCommand(snapshotCreateCmd)
+	snapshotCmd.AddCommand(snapshotRestoreCmd)
+	snapshotCmd.AddCommand(snapshotListCmd)
+	snapshotCmd.AddCommand(snapshotDeleteCmd)
+	rootCmd.AddCommand(resizeCmd)
 	rootCmd.AddCommand(kernelCmd)
 	kernelCmd.AddCommand(kernelPullCmd)
 	kernelCmd.AddCommand(kernelListCmd)
@@ -506,6 +552,87 @@ func runKernelList(cmd *cobra.Command, args []string) error {
 	for _, item := range items {
 		fmt.Printf("  %s\n", item.Ref)
 	}
+	return nil
+}
+
+func runSnapshotCreate(cmd *cobra.Command, args []string) error {
+	cfg, workDir, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	mgr, err := createManager(cfg, workDir)
+	if err != nil {
+		return err
+	}
+	if err := mgr.Snapshot(context.Background(), args[0], args[1]); err != nil {
+		return err
+	}
+	fmt.Printf("Snapshot %q created for %s\n", args[1], args[0])
+	return nil
+}
+
+func runSnapshotRestore(cmd *cobra.Command, args []string) error {
+	cfg, workDir, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	mgr, err := createManager(cfg, workDir)
+	if err != nil {
+		return err
+	}
+	if err := mgr.RestoreSnapshot(context.Background(), args[0], args[1]); err != nil {
+		return err
+	}
+	fmt.Printf("Restored %s to snapshot %q\n", args[0], args[1])
+	return nil
+}
+
+func runSnapshotList(cmd *cobra.Command, args []string) error {
+	cfg, workDir, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	mgr, err := createManager(cfg, workDir)
+	if err != nil {
+		return err
+	}
+	out, err := mgr.ListSnapshots(context.Background(), args[0])
+	if err != nil {
+		return err
+	}
+	fmt.Print(out)
+	return nil
+}
+
+func runSnapshotDelete(cmd *cobra.Command, args []string) error {
+	cfg, workDir, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	mgr, err := createManager(cfg, workDir)
+	if err != nil {
+		return err
+	}
+	if err := mgr.DeleteSnapshot(context.Background(), args[0], args[1]); err != nil {
+		return err
+	}
+	fmt.Printf("Deleted snapshot %q from %s\n", args[1], args[0])
+	return nil
+}
+
+func runResize(cmd *cobra.Command, args []string) error {
+	cfg, workDir, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	mgr, err := createManager(cfg, workDir)
+	if err != nil {
+		return err
+	}
+	if err := mgr.Resize(context.Background(), args[0], args[1]); err != nil {
+		return err
+	}
+	fmt.Printf("Resized %s to %s\n", args[0], args[1])
 	return nil
 }
 

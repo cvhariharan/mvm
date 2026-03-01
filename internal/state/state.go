@@ -32,12 +32,12 @@ type VMState struct {
 	Image string `json:"image"`
 
 	// Resolved artifact paths (absolute, into cache)
-	KernelPath    string `json:"kernel_path"`
-	InitrdPath    string `json:"initrd_path"`
-	RootfsPath    string `json:"rootfs_path"`
-	OverlayPath   string `json:"overlay_path"`
-	SocketPath    string `json:"socket_path"`     // control channel
-	ConsolePath   string `json:"console_path"`    // serial console
+	KernelPath  string `json:"kernel_path"`
+	InitrdPath  string `json:"initrd_path"`
+	RootfsPath  string `json:"rootfs_path"`
+	OverlayPath string `json:"overlay_path"`
+	SocketPath  string `json:"socket_path"`  // control channel
+	ConsolePath string `json:"console_path"` // serial console
 
 	// VM configuration (needed to rebuild QEMU args on restart)
 	Memory    string            `json:"memory"`
