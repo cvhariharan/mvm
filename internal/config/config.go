@@ -18,7 +18,6 @@ const (
 	DefaultBackend = "qemu"
 	DefaultDNS     = "10.0.2.3"
 	DefaultNetMode = "slirp"
-	DefaultWSGuest = "/workspace"
 	ConfigFile     = ".mvm"
 )
 
@@ -51,8 +50,8 @@ type NetworkConfig struct {
 }
 
 type MountConfig struct {
-	Workspace   string            `koanf:"workspace"`
-	ExtraMounts map[string]string `koanf:"extra"`
+	MountWorkspace bool              `koanf:"mount_workspace"`
+	ExtraMounts    map[string]string `koanf:"-"`
 }
 
 type CacheConfig struct {
@@ -60,14 +59,13 @@ type CacheConfig struct {
 }
 
 var defaults = map[string]interface{}{
-	"vm.image":        DefaultImage,
-	"vm.kernel":       DefaultKernel,
-	"vm.memory":       DefaultMemory,
-	"vm.cpus":         DefaultCPUs,
-	"vm.backend":      DefaultBackend,
-	"network.mode":    DefaultNetMode,
-	"network.dns":     DefaultDNS,
-	"mounts.workspace": DefaultWSGuest,
+	"vm.image":     DefaultImage,
+	"vm.kernel":    DefaultKernel,
+	"vm.memory":    DefaultMemory,
+	"vm.cpus":      DefaultCPUs,
+	"vm.backend":   DefaultBackend,
+	"network.mode": DefaultNetMode,
+	"network.dns":  DefaultDNS,
 }
 
 // Load reads config with layered merging: defaults → global → project.
@@ -103,6 +101,15 @@ func Load(projectDir string) (*Config, error) {
 		return nil, err
 	}
 
+	// Populate ExtraMounts from the raw [mounts] map, skipping known scalar keys.
+	cfg.Mounts.ExtraMounts = make(map[string]string)
+	for key, val := range k.StringMap("mounts") {
+		if key == "mount_workspace" {
+			continue
+		}
+		cfg.Mounts.ExtraMounts[key] = val
+	}
+
 	return &cfg, nil
 }
 
@@ -119,7 +126,8 @@ cpus = 2
 mode = "slirp"
 
 [mounts]
-workspace = "/workspace"
+mount_workspace = true
+# "/host/path" = "/guest/path"
 
 [env]
 # KEY = "value"

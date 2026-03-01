@@ -116,10 +116,12 @@ func (m *Manager) Create(ctx context.Context, opts CreateOpts) (*state.VMState, 
 			Mode: m.cfg.Network.Mode,
 			DNS:  m.cfg.Network.DNS,
 		},
-		Workspace: state.WorkspaceState{
-			HostDir:  m.workDir,
-			GuestDir: m.cfg.Mounts.Workspace,
-		},
+		Workspace: func() state.WorkspaceState {
+			if m.cfg.Mounts.MountWorkspace {
+				return state.WorkspaceState{HostDir: m.workDir, GuestDir: m.workDir}
+			}
+			return state.WorkspaceState{}
+		}(),
 		Env: m.cfg.Env,
 	}
 
