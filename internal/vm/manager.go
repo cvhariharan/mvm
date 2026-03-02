@@ -443,6 +443,101 @@ func (m *Manager) Run(ctx context.Context, command string) (int, error) {
 	return res.code, nil
 }
 
+// Rebuild stops the VM (if running), re-extracts the initrd, and updates the
+// VM config (memory, cpus, mounts, ports, env, users, shell) from the current
+// .mvm config file. The rootfs overlay is kept intact so installed packages
+// and other guest-side changes are preserved.
+func (m *Manager) Rebuild(ctx context.Context, id string) (*state.VMState, error) {
+	vmState, err := m.store.Lookup(id)
+	if err != nil {
+		return nil, err
+	}
+
+	if vmState.Status == state.StatusRunning {
+		if err := m.Stop(ctx, vmState.ID); err != nil {
+			return nil, fmt.Errorf("stop before rebuild: %w", err)
+		}
+		waitForExit(vmState.Pid, 10*time.Second)
+	}
+
+	// Re-resolve kernel (picks up kernel config changes)
+	puller, err := kernel.NewPuller()
+	if err != nil {
+		return nil, fmt.Errorf("kernel puller: %w", err)
+	}
+	kernelPath, err := puller.Get(m.cfg.VM.Kernel)
+	if err != nil {
+		return nil, fmt.Errorf("get kernel: %w", err)
+	}
+
+	// Re-extract initrd so new mvm-init code takes effect
+	initrdPath, err := initrd.Extract(m.cacheDir + "/initrd")
+	if err != nil {
+		return nil, fmt.Errorf("extract initrd: %w", err)
+	}
+
+	// Update state from current config, keeping the same ID, name, and overlay.
+	vmState.Status = state.StatusStopped
+	vmState.KernelPath = kernelPath
+	vmState.InitrdPath = initrdPath
+	vmState.Memory = m.cfg.VM.Memory
+	vmState.CPUs = m.cfg.VM.CPUs
+	vmState.Shell = filepath.Base(os.Getenv("SHELL"))
+	vmState.Network = state.NetworkState{
+		Mode:  m.cfg.Network.Mode,
+		DNS:   m.cfg.Network.DNS,
+		Ports: configPortsToState(m.cfg.Network.Ports),
+	}
+	vmState.Workspace = func() state.WorkspaceState {
+		ws := state.WorkspaceState{HostDir: m.workDir}
+		if m.cfg.Mounts.MountWorkspace {
+			ws.GuestDir = m.workDir
+		}
+		return ws
+	}()
+	vmState.Env = m.cfg.Env
+
+	// Update extra mounts from config
+	vmState.ExtraMounts = nil
+	i := 0
+	for hostPath, guestPath := range m.cfg.Mounts.ExtraMounts {
+		tag := fmt.Sprintf("mnt%d", i)
+		vmState.ExtraMounts = append(vmState.ExtraMounts, state.MountState{
+			Tag:      tag,
+			HostDir:  hostPath,
+			GuestDir: guestPath,
+		})
+		i++
+	}
+
+	// Update users from config
+	hostUID := os.Getuid()
+	hostGID := os.Getgid()
+	hostUser, err := user.Current()
+	if err != nil {
+		return nil, fmt.Errorf("get current user: %w", err)
+	}
+	vmState.UID = strconv.Itoa(hostUID) + ":" + strconv.Itoa(hostGID)
+	vmState.Users = []state.UserState{{
+		Name: hostUser.Username,
+		UID:  hostUID,
+		GID:  hostGID,
+	}}
+	for _, u := range m.cfg.Users {
+		vmState.Users = append(vmState.Users, state.UserState{
+			Name: u.Name,
+			UID:  u.UID,
+			GID:  u.GID,
+		})
+	}
+
+	if err := m.store.Save(vmState); err != nil {
+		return nil, fmt.Errorf("save state: %w", err)
+	}
+
+	return vmState, nil
+}
+
 // Build pre-caches the kernel and rootfs without running a VM.
 func (m *Manager) Build(ctx context.Context) error {
 	puller, err := kernel.NewPuller()

@@ -117,6 +117,12 @@ var destroyCmd = &cobra.Command{
 	RunE:  runDestroy,
 }
 
+var rebuildCmd = &cobra.Command{
+	Use:   "rebuild",
+	Short: "Recreate the workspace's microVM with a fresh rootfs and current config",
+	RunE:  runRebuild,
+}
+
 var snapshotCmd = &cobra.Command{
 	Use:   "snapshot",
 	Short: "Snapshot management commands",
@@ -176,7 +182,7 @@ var kernelListCmd = &cobra.Command{
 }
 
 func init() {
-	for _, cmd := range []*cobra.Command{runCmd, shellCmd, buildCmd, createCmd, upCmd} {
+	for _, cmd := range []*cobra.Command{runCmd, shellCmd, buildCmd, createCmd, upCmd, rebuildCmd} {
 		cmd.Flags().StringVar(&flagImage, "image", "", "container image")
 		cmd.Flags().StringVar(&flagMemory, "memory", "", "memory size (e.g. 512M)")
 		cmd.Flags().IntVar(&flagCPUs, "cpus", 0, "number of CPUs")
@@ -202,6 +208,7 @@ func init() {
 	rootCmd.AddCommand(buildCmd)
 	rootCmd.AddCommand(upCmd)
 	rootCmd.AddCommand(destroyCmd)
+	rootCmd.AddCommand(rebuildCmd)
 	rootCmd.AddCommand(snapshotCmd)
 	snapshotCmd.AddCommand(snapshotCreateCmd)
 	snapshotCmd.AddCommand(snapshotRestoreCmd)
@@ -508,6 +515,40 @@ func runDestroy(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("Destroyed VM %s (workspace: %s)\n", vmState.ID, workDir)
+	return nil
+}
+
+func runRebuild(cmd *cobra.Command, args []string) error {
+	cfg, workDir, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	store, err := state.NewStore()
+	if err != nil {
+		return fmt.Errorf("state store: %w", err)
+	}
+
+	vmState, err := store.LookupByWorkspace(workDir)
+	if err != nil {
+		return fmt.Errorf("lookup workspace VM: %w", err)
+	}
+	if vmState == nil {
+		return fmt.Errorf("no VM found for workspace %s", workDir)
+	}
+
+	mgr, err := createManager(cfg, workDir)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Rebuilding VM %s...\n", vmState.ID)
+	vmState, err = mgr.Rebuild(context.Background(), vmState.ID)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Rebuilt VM %s (workspace: %s)\n", vmState.ID, workDir)
 	return nil
 }
 
