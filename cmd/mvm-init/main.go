@@ -193,12 +193,43 @@ func installPackages(pm pkgManager, pkgs []string) error {
 	return cmd.Run()
 }
 
+// updatePackageCache refreshes the package manager's metadata cache so that
+// installs don't fail on images with an empty cache (e.g. Debian/Ubuntu).
+func updatePackageCache(pm pkgManager) error {
+	var args []string
+	switch pm {
+	case pkgManagerApk:
+		args = []string{"update"}
+	case pkgManagerAptGet:
+		args = []string{"update"}
+	case pkgManagerDnf:
+		args = []string{"makecache"}
+	case pkgManagerMicrodnf:
+		args = []string{"makecache"}
+	case pkgManagerPacman:
+		args = []string{"-Sy", "--noconfirm"}
+	case pkgManagerEmerge:
+		return nil // emerge --sync is too slow; skip
+	default:
+		return nil
+	}
+	cmd := exec.Command(pmBinPath(pm), args...)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
 // installShellAndTools installs the user's shell (with bash fallback) and a
 // minimal set of host tools using the detected package manager. It returns
 // the name of the shell that was actually installed (may differ from the
 // requested shell if the install failed and bash was used as fallback).
 func installShellAndTools(pm pkgManager, shell string) (string, error) {
 	names := pkgNames[pm]
+
+	// Refresh the package cache before installing anything.
+	if err := updatePackageCache(pm); err != nil {
+		fmt.Fprintf(os.Stderr, "[mvm] package cache update failed: %v\n", err)
+	}
 
 	// Install the user's shell first; fall back to bash on failure.
 	if err := installPackages(pm, []string{shell}); err != nil {
@@ -304,15 +335,19 @@ func run() error {
 
 	setupNetworking()
 
-	pm := detectPackageManager()
-	if pm != pkgManagerUnknown {
-		fmt.Fprintf(os.Stderr, "[mvm] installing host tools (%s)...\n", pm)
-		if effectiveShell, err := installShellAndTools(pm, shell); err != nil {
-			fmt.Fprintf(os.Stderr, "[mvm] host tools install failed: %v\n", err)
-		} else {
-			shell = effectiveShell
-			fmt.Fprintf(os.Stderr, "[mvm] host tools installed\n")
+	const installMarker = "/var/lib/mvm/.installed"
+	if _, err := os.Stat(installMarker); err != nil {
+		pm := detectPackageManager()
+		if pm != pkgManagerUnknown {
+			fmt.Fprintf(os.Stderr, "[mvm] installing host tools (%s)...\n", pm)
+			if effectiveShell, err := installShellAndTools(pm, shell); err != nil {
+				fmt.Fprintf(os.Stderr, "[mvm] host tools install failed: %v\n", err)
+			} else {
+				shell = effectiveShell
+				fmt.Fprintf(os.Stderr, "[mvm] host tools installed\n")
+			}
 		}
+		writeFile(installMarker, "", 0644)
 	}
 
 	createUsers(mvmUsers, shell)
