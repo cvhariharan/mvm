@@ -207,12 +207,41 @@ func (m *Manager) Start(ctx context.Context, id string, foreground bool) (int, e
 		return 0, nil
 	}
 
-	// Attach to console — returns when user detaches, VM keeps running
-	m.backend.Attach(ctx, vm)
-	return 0, nil
+	// In foreground mode, race between console detach (Ctrl+]) and
+	// workload exit (Ctrl+D / shell exit). If the workload exits first,
+	// stop the VM so the console socket closes and bridgeConsole returns.
+	consoleDone := make(chan struct{})
+	go func() {
+		m.backend.Attach(ctx, vm)
+		close(consoleDone)
+	}()
+
+	exitCtx, exitCancel := context.WithCancel(ctx)
+	defer exitCancel()
+
+	exitDone := make(chan int, 1)
+	go func() {
+		code, _ := m.backend.WaitExit(exitCtx, vm)
+		exitDone <- code
+	}()
+
+	exitCode := 0
+	select {
+	case <-consoleDone:
+		// User detached (Ctrl+]) — VM keeps running.
+		exitCancel()
+	case code := <-exitDone:
+		// Workload exited — stop the VM.
+		exitCode = code
+		m.Stop(ctx, id)
+		<-consoleDone
+	}
+
+	return exitCode, nil
 }
 
-// Stop sends SIGTERM to a running VM, waiting up to 10s before SIGKILL.
+// Stop initiates a graceful VM shutdown and returns immediately. A background
+// goroutine handles the escalation: shutdown message → SIGTERM → SIGKILL.
 func (m *Manager) Stop(ctx context.Context, id string) error {
 	vmState, err := m.store.Lookup(id)
 	if err != nil {
@@ -223,32 +252,47 @@ func (m *Manager) Stop(ctx context.Context, id string) error {
 	}
 
 	vm := stateToVM(vmState)
+	pid := vmState.Pid
 
-	// Graceful stop
-	if err := m.backend.Stop(ctx, vm); err != nil {
-		return fmt.Errorf("stop vm: %w", err)
-	}
+	// Send shutdown message (or SIGTERM if no ctrl channel).
+	m.backend.Stop(ctx, vm)
 
-	// Wait for process to exit
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if !vmState.IsAlive() {
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-
-	// Force kill if still alive
-	if vmState.IsAlive() {
-		if proc, err := os.FindProcess(vmState.Pid); err == nil {
-			proc.Signal(syscall.SIGKILL)
-		}
-	}
-
+	// Mark stopped immediately so the CLI exits without delay.
 	vmState.Status = state.StatusStopped
 	vmState.StoppedAt = time.Now()
 	vmState.Pid = 0
-	return m.store.Save(vmState)
+	if err := m.store.Save(vmState); err != nil {
+		return fmt.Errorf("save state: %w", err)
+	}
+
+	// Escalate in the background: wait for graceful exit, then SIGTERM, then SIGKILL.
+	go func() {
+		proc, err := os.FindProcess(pid)
+		if err != nil {
+			return
+		}
+		// Give the guest time to sync + power off.
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if err := proc.Signal(syscall.Signal(0)); err != nil {
+				return // already exited
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		// Still alive — SIGTERM.
+		proc.Signal(syscall.SIGTERM)
+		deadline = time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if err := proc.Signal(syscall.Signal(0)); err != nil {
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		// Still alive — SIGKILL.
+		proc.Signal(syscall.SIGKILL)
+	}()
+
+	return nil
 }
 
 // Remove deletes a VM and its artifacts. If force is true, stops it first.
@@ -392,6 +436,7 @@ func (m *Manager) Run(ctx context.Context, command string) (int, error) {
 
 	// Stop the VM and clean up without touching the store.
 	m.backend.Stop(ctx, vm)
+	waitForExit(vm.Pid, 10*time.Second)
 	m.backend.Destroy(ctx, vm)
 	os.RemoveAll(m.store.VMDir(vmState.ID))
 
@@ -423,6 +468,26 @@ func (m *Manager) Build(ctx context.Context) error {
 
 	fmt.Println("Build complete")
 	return nil
+}
+
+// waitForExit polls until the process has exited or the timeout expires.
+// If still alive after the timeout, it sends SIGKILL.
+func waitForExit(pid int, timeout time.Duration) {
+	if pid <= 0 {
+		return
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err := proc.Signal(syscall.Signal(0)); err != nil {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	proc.Signal(syscall.SIGKILL)
 }
 
 // stateToVMConfig converts persisted state back to the backend VMConfig.

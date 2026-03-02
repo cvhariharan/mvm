@@ -194,8 +194,10 @@ func installPackages(pm pkgManager, pkgs []string) error {
 }
 
 // installShellAndTools installs the user's shell (with bash fallback) and a
-// minimal set of host tools using the detected package manager.
-func installShellAndTools(pm pkgManager, shell string) error {
+// minimal set of host tools using the detected package manager. It returns
+// the name of the shell that was actually installed (may differ from the
+// requested shell if the install failed and bash was used as fallback).
+func installShellAndTools(pm pkgManager, shell string) (string, error) {
 	names := pkgNames[pm]
 
 	// Install the user's shell first; fall back to bash on failure.
@@ -203,7 +205,7 @@ func installShellAndTools(pm pkgManager, shell string) error {
 		fmt.Fprintf(os.Stderr, "[mvm] could not install %s, falling back to bash\n", shell)
 		shell = "bash"
 		if err := installPackages(pm, []string{shell}); err != nil {
-			return fmt.Errorf("install shell: %w", err)
+			return shell, fmt.Errorf("install shell: %w", err)
 		}
 	}
 
@@ -218,11 +220,11 @@ func installShellAndTools(pm pkgManager, shell string) error {
 
 	if len(pkgs) > 0 {
 		if err := installPackages(pm, pkgs); err != nil {
-			return fmt.Errorf("install tools: %w", err)
+			return shell, fmt.Errorf("install tools: %w", err)
 		}
 	}
 
-	return nil
+	return shell, nil
 }
 
 func init() {
@@ -305,9 +307,10 @@ func run() error {
 	pm := detectPackageManager()
 	if pm != pkgManagerUnknown {
 		fmt.Fprintf(os.Stderr, "[mvm] installing host tools (%s)...\n", pm)
-		if err := installShellAndTools(pm, shell); err != nil {
+		if effectiveShell, err := installShellAndTools(pm, shell); err != nil {
 			fmt.Fprintf(os.Stderr, "[mvm] host tools install failed: %v\n", err)
 		} else {
+			shell = effectiveShell
 			fmt.Fprintf(os.Stderr, "[mvm] host tools installed\n")
 		}
 	}
@@ -326,6 +329,11 @@ func run() error {
 	})})
 
 	shellPath := resolveShellPath(shell)
+
+	// Write env vars and workspace cd to /etc/profile.d/ so login shells
+	// source them automatically — works with any shell, no `su` needed.
+	writeEnvProfile(mvmEnv)
+	writeWorkspaceProfile(mvmWS)
 
 	// Run initial workload
 	exitCode := 0
@@ -346,13 +354,18 @@ func run() error {
 	}
 
 	// With a working ctrl channel, wait for exec commands from the host.
-	// The VM shuts down when the ctrl channel closes (host disconnects).
+	// The VM shuts down when the ctrl channel closes (host disconnects)
+	// or the host sends a shutdown message.
+	dec := json.NewDecoder(ctrl)
 	for {
 		var msg proto.Message
-		if err := json.NewDecoder(ctrl).Decode(&msg); err != nil {
+		if err := dec.Decode(&msg); err != nil {
 			break // ctrl channel closed — shut down
 		}
-		if msg.Type == proto.TypeExec {
+		switch msg.Type {
+		case proto.TypeShutdown:
+			break // host requested shutdown
+		case proto.TypeExec:
 			var p proto.ExecPayload
 			json.Unmarshal(msg.Payload, &p)
 			for k, v := range p.Env {
@@ -360,7 +373,11 @@ func run() error {
 			}
 			code := runWorkload(p.Cmd, shellPath, mvmEnv, mvmUID, mvmUsers, "")
 			sendMsg(ctrl, proto.Message{Type: proto.TypeExit, Payload: mustJSON(proto.ExitPayload{Code: code})})
+			continue
+		default:
+			continue
 		}
+		break
 	}
 
 	svcManager.StopAll(5 * time.Second)
@@ -397,6 +414,12 @@ func runWorkload(cmd string, shellPath string, env map[string]string, uidGid str
 		return runWorkloadNoPTY(parts, shellPath, env, uidGid, users, workdir)
 	}
 	c := exec.Command(parts[0], parts[1:]...)
+	// Launch as a login shell when running the user's shell interactively.
+	// Setting argv[0] to "-<name>" is the POSIX convention that tells shells
+	// to source /etc/profile, ~/.profile, etc.
+	if cmd == shellPath && len(parts) == 1 {
+		c.Args[0] = "-" + filepath.Base(shellPath)
+	}
 	c.Stdin = pts
 	c.Stdout = pts
 	c.Stderr = pts
@@ -1126,6 +1149,36 @@ func upsertSudoers(u user) {
 	path := "/etc/sudoers.d/" + u.Name
 	line := fmt.Sprintf("%s ALL=(ALL) NOPASSWD:ALL\n", u.Name)
 	writeFile(path, line, 0440)
+}
+
+// writeEnvProfile writes custom mvm environment variables to
+// /etc/profile.d/mvm-env.sh so that `su -` login shells pick them up.
+func writeEnvProfile(env map[string]string) {
+	if len(env) == 0 {
+		return
+	}
+	var b strings.Builder
+	for k, v := range env {
+		fmt.Fprintf(&b, "export %s=%s\n", k, shellescape(v))
+	}
+	writeFile("/etc/profile.d/mvm-env.sh", b.String(), 0644)
+}
+
+// writeWorkspaceProfile writes a cd to the workspace directory in
+// /etc/profile.d/zz-mvm-ws.sh. The zz- prefix ensures it runs after
+// other profile.d scripts.
+func writeWorkspaceProfile(ws string) {
+	if ws == "" {
+		return
+	}
+	content := fmt.Sprintf("cd %s 2>/dev/null\n", shellescape(ws))
+	writeFile("/etc/profile.d/zz-mvm-ws.sh", content, 0644)
+}
+
+// shellescape wraps a value in single quotes, escaping embedded single
+// quotes with the '\'' idiom. Safe for POSIX sh.
+func shellescape(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
 // rewriteOrAppendEvict rewrites any line starting with namePrefix to newLine,

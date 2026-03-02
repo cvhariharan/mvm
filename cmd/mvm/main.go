@@ -327,9 +327,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	vmState, err = mgr.Create(context.Background(), vm.CreateOpts{
-		Command: "/bin/sh",
-	})
+	vmState, err = mgr.Create(context.Background(), vm.CreateOpts{})
 	if err != nil {
 		return err
 	}

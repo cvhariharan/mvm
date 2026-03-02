@@ -33,9 +33,10 @@ type ExecPayload struct {
 
 // Message type constants.
 const (
-	TypeReady = "ready"
-	TypeExit  = "exit"
-	TypeLog   = "log"
-	TypeExec  = "exec"
-	TypeError = "error"
+	TypeReady    = "ready"
+	TypeExit     = "exit"
+	TypeLog      = "log"
+	TypeExec     = "exec"
+	TypeError    = "error"
+	TypeShutdown = "shutdown"
 )

@@ -19,9 +19,11 @@ import (
 
 // runningVM tracks a QEMU process launched by this CLI invocation.
 type runningVM struct {
-	cmd    *exec.Cmd
-	exitCh chan int
-	cancel context.CancelFunc
+	cmd      *exec.Cmd
+	exitCh   chan int
+	cancel   context.CancelFunc
+	ctrlConn net.Conn
+	ctrlMu   sync.Mutex
 }
 
 // QEMU implements the backend.Backend interface.
@@ -97,15 +99,14 @@ func (q *QEMU) Start(ctx context.Context, vm *backend.VM, cfg *backend.VMConfig)
 	}
 	vm.Pid = cmd.Process.Pid
 
-	// Read exit code from control channel in background
-	exitCh := make(chan int, 1)
-	go func() {
-		exitCh <- q.readCtrl(vm.CtrlSocket)
-	}()
+	rvm := &runningVM{cmd: cmd, exitCh: make(chan int, 1), cancel: cancel}
 
 	q.mu.Lock()
-	q.running[vm.ID] = &runningVM{cmd: cmd, exitCh: exitCh, cancel: cancel}
+	q.running[vm.ID] = rvm
 	q.mu.Unlock()
+
+	// Read exit code from control channel in background
+	go q.manageCtrl(rvm, vm.CtrlSocket)
 
 	return nil
 }
@@ -136,7 +137,7 @@ func (q *QEMU) WaitExit(ctx context.Context, vm *backend.VM) (int, error) {
 	}
 }
 
-func (q *QEMU) readCtrl(socketPath string) int {
+func (q *QEMU) manageCtrl(rvm *runningVM, socketPath string) {
 	var conn net.Conn
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
@@ -148,9 +149,19 @@ func (q *QEMU) readCtrl(socketPath string) int {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if conn == nil {
-		return 1
+		return
 	}
-	defer conn.Close()
+
+	rvm.ctrlMu.Lock()
+	rvm.ctrlConn = conn
+	rvm.ctrlMu.Unlock()
+
+	defer func() {
+		rvm.ctrlMu.Lock()
+		rvm.ctrlConn = nil
+		rvm.ctrlMu.Unlock()
+		conn.Close()
+	}()
 
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
@@ -162,21 +173,42 @@ func (q *QEMU) readCtrl(socketPath string) int {
 		case proto.TypeExit:
 			var p proto.ExitPayload
 			json.Unmarshal(msg.Payload, &p)
-			return p.Code
+			// Forward exit code but keep connection alive for shutdown.
+			select {
+			case rvm.exitCh <- p.Code:
+			default:
+			}
 		case proto.TypeReady:
 			// VM is ready, continue reading
 		}
 	}
-	return 1
 }
 
 func (q *QEMU) Stop(_ context.Context, vm *backend.VM) error {
-	if vm.Pid > 0 {
-		proc, err := os.FindProcess(vm.Pid)
-		if err != nil {
+	q.mu.Lock()
+	rvm := q.running[vm.ID]
+	q.mu.Unlock()
+
+	// Send graceful shutdown via ctrl channel. Non-blocking — the caller
+	// is responsible for waiting/escalating.
+	if rvm != nil {
+		rvm.ctrlMu.Lock()
+		conn := rvm.ctrlConn
+		rvm.ctrlMu.Unlock()
+		if conn != nil {
+			msg := proto.Message{Type: proto.TypeShutdown}
+			b, _ := json.Marshal(msg)
+			b = append(b, '\n')
+			conn.Write(b)
 			return nil
 		}
-		return proc.Signal(syscall.SIGTERM)
+	}
+
+	// No ctrl channel available — SIGTERM as fallback.
+	if vm.Pid > 0 {
+		if proc, err := os.FindProcess(vm.Pid); err == nil {
+			proc.Signal(syscall.SIGTERM)
+		}
 	}
 	return nil
 }
