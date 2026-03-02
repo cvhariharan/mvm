@@ -293,7 +293,7 @@ func run() error {
 		writeFile("/etc/hosts", "127.0.0.1 localhost\n::1 localhost\n", 0644)
 	}
 
-	createUsers(mvmUsers)
+	shell := userShell(mvmShell)
 
 	if mvmHostname != "" {
 		syscall.Sethostname([]byte(mvmHostname))
@@ -303,7 +303,6 @@ func run() error {
 	setupNetworking()
 
 	pm := detectPackageManager()
-	shell := userShell(mvmShell)
 	if pm != pkgManagerUnknown {
 		fmt.Fprintf(os.Stderr, "[mvm] installing host tools (%s)...\n", pm)
 		if err := installShellAndTools(pm, shell); err != nil {
@@ -312,6 +311,8 @@ func run() error {
 			fmt.Fprintf(os.Stderr, "[mvm] host tools installed\n")
 		}
 	}
+
+	createUsers(mvmUsers, shell)
 
 	ctrl := openCtrl()
 
@@ -324,12 +325,14 @@ func run() error {
 		Services: svcManager.RunningNames(),
 	})})
 
+	shellPath := resolveShellPath(shell)
+
 	// Run initial workload
 	exitCode := 0
 	if mvmCmd != "" {
-		exitCode = runWorkload(mvmCmd, mvmEnv, mvmUID, mvmUsers, mvmWS)
+		exitCode = runWorkload(mvmCmd, shellPath, mvmEnv, mvmUID, mvmUsers, mvmWS)
 	} else {
-		exitCode = runWorkload(resolveShellPath(shell), mvmEnv, mvmUID, mvmUsers, mvmWS)
+		exitCode = runWorkload(shellPath, shellPath, mvmEnv, mvmUID, mvmUsers, mvmWS)
 	}
 	sendMsg(ctrl, proto.Message{Type: proto.TypeExit, Payload: mustJSON(proto.ExitPayload{Code: exitCode})})
 
@@ -338,7 +341,7 @@ func run() error {
 		// No ctrl channel — respawn a shell each time it exits.
 		// The VM stays alive until QEMU is killed externally (mvm stop).
 		for {
-			runWorkload(resolveShellPath(shell), mvmEnv, mvmUID, mvmUsers, mvmWS)
+			runWorkload(shellPath, shellPath, mvmEnv, mvmUID, mvmUsers, mvmWS)
 		}
 	}
 
@@ -355,7 +358,7 @@ func run() error {
 			for k, v := range p.Env {
 				mvmEnv[k] = v
 			}
-			code := runWorkload(p.Cmd, mvmEnv, mvmUID, mvmUsers, "")
+			code := runWorkload(p.Cmd, shellPath, mvmEnv, mvmUID, mvmUsers, "")
 			sendMsg(ctrl, proto.Message{Type: proto.TypeExit, Payload: mustJSON(proto.ExitPayload{Code: code})})
 		}
 	}
@@ -379,7 +382,7 @@ func resolveShellPath(shell string) string {
 	return "/bin/sh"
 }
 
-func runWorkload(cmd string, env map[string]string, uidGid string, users []user, workdir string) int {
+func runWorkload(cmd string, shellPath string, env map[string]string, uidGid string, users []user, workdir string) int {
 	parts := strings.Fields(cmd)
 	if len(parts) == 0 {
 		return 0
@@ -391,7 +394,7 @@ func runWorkload(cmd string, env map[string]string, uidGid string, users []user,
 	if err != nil {
 		// Fall back to direct I/O if PTY allocation fails.
 		fmt.Fprintf(os.Stderr, "mvm-init: pty open failed (%v), running without pty\n", err)
-		return runWorkloadNoPTY(parts, env, uidGid, users, workdir)
+		return runWorkloadNoPTY(parts, shellPath, env, uidGid, users, workdir)
 	}
 	c := exec.Command(parts[0], parts[1:]...)
 	c.Stdin = pts
@@ -414,6 +417,7 @@ func runWorkload(cmd string, env map[string]string, uidGid string, users []user,
 			if u.UID == uid {
 				overrides["USER"] = u.Name
 				overrides["HOME"] = "/home/" + u.Name
+				overrides["SHELL"] = shellPath
 				if workdir != "" {
 					c.Dir = workdir
 				} else {
@@ -460,7 +464,11 @@ func runWorkload(cmd string, env map[string]string, uidGid string, users []user,
 	// Signal bridge goroutines to stop by closing the master.
 	ptm.Close()
 	<-done
-	<-done
+	// The stdin→ptm goroutine is intentionally not awaited: os.Stdin is the
+	// VM's ttyS0 serial port which has no EOF, so io.Copy(ptm, os.Stdin) blocks
+	// forever once ptm is closed. Waiting for it would deadlock runWorkload and
+	// prevent the exit code from being sent to the host. The goroutine is cleaned
+	// up when mvm-init exits.
 
 	// Restore ttyS0 to cooked mode for any subsequent workload.
 	setCooked(os.Stdin.Fd())
@@ -571,7 +579,7 @@ func setCooked(fd uintptr) error {
 }
 
 // runWorkloadNoPTY is a fallback that runs the command without a PTY.
-func runWorkloadNoPTY(parts []string, env map[string]string, uidGid string, users []user, workdir string) int {
+func runWorkloadNoPTY(parts []string, shellPath string, env map[string]string, uidGid string, users []user, workdir string) int {
 	c := exec.Command(parts[0], parts[1:]...)
 	c.Stdin = os.Stdin
 	c.Stdout = os.Stdout
@@ -589,6 +597,7 @@ func runWorkloadNoPTY(parts []string, env map[string]string, uidGid string, user
 			if u.UID == uid {
 				overrides["USER"] = u.Name
 				overrides["HOME"] = "/home/" + u.Name
+				overrides["SHELL"] = shellPath
 				if workdir != "" {
 					c.Dir = workdir
 				} else {
@@ -613,7 +622,7 @@ func runWorkloadNoPTY(parts []string, env map[string]string, uidGid string, user
 	return 0
 }
 
-func waitForExec(ctrl io.ReadWriteCloser, env map[string]string, uidGid string, users []user) int {
+func waitForExec(ctrl io.ReadWriteCloser, shellPath string, env map[string]string, uidGid string, users []user) int {
 	dec := json.NewDecoder(ctrl)
 	for {
 		var msg proto.Message
@@ -626,7 +635,7 @@ func waitForExec(ctrl io.ReadWriteCloser, env map[string]string, uidGid string, 
 			for k, v := range p.Env {
 				env[k] = v
 			}
-			return runWorkload(p.Cmd, env, uidGid, users, "")
+			return runWorkload(p.Cmd, shellPath, env, uidGid, users, "")
 		}
 	}
 }
@@ -1075,9 +1084,9 @@ func decodeUsers(encoded string) []user {
 	return users
 }
 
-func createUsers(users []user) {
+func createUsers(users []user, shell string) {
 	for _, u := range users {
-		upsertPasswd(u)
+		upsertPasswd(u, shell)
 		upsertGroup(u)
 		upsertShadow(u)
 		ensureHome(u)
@@ -1085,9 +1094,10 @@ func createUsers(users []user) {
 	}
 }
 
-func upsertPasswd(u user) {
+func upsertPasswd(u user, shell string) {
 	homeDir := "/home/" + u.Name
-	newLine := fmt.Sprintf("%s:x:%d:%d::%s:/bin/sh", u.Name, u.UID, u.GID, homeDir)
+	shellPath := resolveShellPath(shell)
+	newLine := fmt.Sprintf("%s:x:%d:%d::%s:%s", u.Name, u.UID, u.GID, homeDir, shellPath)
 	uidField := fmt.Sprintf(":%d:", u.UID)
 	rewriteOrAppendEvict("/etc/passwd", u.Name+":", uidField, newLine)
 }
