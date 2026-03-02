@@ -3,6 +3,7 @@ module github.com/cvhariharan/mvm
 go 1.24.6
 
 require (
+	github.com/creack/pty v1.1.24
 	github.com/knadh/koanf/parsers/toml v0.1.0
 	github.com/knadh/koanf/providers/confmap v1.0.0
 	github.com/knadh/koanf/providers/file v1.2.1
@@ -11,6 +12,7 @@ require (
 	github.com/moby/moby/client v0.2.1
 	github.com/spf13/cobra v1.10.2
 	github.com/u-root/u-root v0.15.0
+	golang.org/x/term v0.40.0
 )
 
 require (
@@ -43,5 +45,4 @@ require (
 	go.opentelemetry.io/otel/metric v1.36.0 // indirect
 	go.opentelemetry.io/otel/trace v1.36.0 // indirect
 	golang.org/x/sys v0.41.0 // indirect
-	golang.org/x/term v0.40.0 // indirect
 )

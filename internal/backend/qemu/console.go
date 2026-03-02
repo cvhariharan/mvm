@@ -54,6 +54,12 @@ func bridgeConsole(socketPath string) {
 		done <- struct{}{}
 	}()
 
+	// Wait for the first goroutine to finish, then close the connection to
+	// unblock the other: io.Copy returns on read error, copyUntilEscape
+	// returns on write error (now propagated). Both goroutines exit before
+	// term.Restore fires via defer, preventing stray output on the restored terminal.
+	<-done
+	conn.Close()
 	<-done
 }
 
@@ -88,11 +94,13 @@ func AttachConsole(socketPath string) error {
 	}()
 
 	<-done
+	conn.Close()
+	<-done
 	return nil
 }
 
 // copyUntilEscape copies from src to dst, returning when Ctrl+] (0x1d) is
-// pressed or the source closes.
+// pressed, the source closes, or a write to dst fails (e.g. conn closed).
 func copyUntilEscape(dst io.Writer, src io.Reader) error {
 	buf := make([]byte, 256)
 	for {
@@ -100,13 +108,17 @@ func copyUntilEscape(dst io.Writer, src io.Reader) error {
 		for i := 0; i < n; i++ {
 			if buf[i] == 0x1d { // Ctrl+]
 				if i > 0 {
-					dst.Write(buf[:i])
+					if _, werr := dst.Write(buf[:i]); werr != nil {
+						return werr
+					}
 				}
 				return nil
 			}
 		}
 		if n > 0 {
-			dst.Write(buf[:n])
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return werr // dst closed: stop copying
+			}
 		}
 		if err != nil {
 			return err

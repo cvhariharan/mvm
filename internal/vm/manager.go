@@ -126,7 +126,7 @@ func (m *Manager) Create(ctx context.Context, opts CreateOpts) (*state.VMState, 
 			}
 			return ws
 		}(),
-		Env: m.cfg.Env,
+		Env: mergeTermEnv(m.cfg.Env),
 	}
 
 	// Always create a guest user matching the host user (same name, uid, gid)
@@ -495,7 +495,7 @@ func (m *Manager) Rebuild(ctx context.Context, id string) (*state.VMState, error
 		}
 		return ws
 	}()
-	vmState.Env = m.cfg.Env
+	vmState.Env = mergeTermEnv(m.cfg.Env)
 
 	// Update extra mounts from config
 	vmState.ExtraMounts = nil
@@ -675,4 +675,22 @@ func generateID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// mergeTermEnv returns a copy of env with TERM and COLORTERM forwarded from
+// the host environment when not already set. This ensures the guest shell
+// receives the correct terminal type so that readline/key bindings work.
+func mergeTermEnv(env map[string]string) map[string]string {
+	out := make(map[string]string, len(env)+2)
+	for k, v := range env {
+		out[k] = v
+	}
+	for _, key := range []string{"TERM", "COLORTERM"} {
+		if _, ok := out[key]; !ok {
+			if v := os.Getenv(key); v != "" {
+				out[key] = v
+			}
+		}
+	}
+	return out
 }
