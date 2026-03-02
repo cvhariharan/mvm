@@ -1081,6 +1081,7 @@ func createUsers(users []user) {
 		upsertGroup(u)
 		upsertShadow(u)
 		ensureHome(u)
+		upsertSudoers(u)
 	}
 }
 
@@ -1109,6 +1110,12 @@ func ensureHome(u user) {
 	homeDir := "/home/" + u.Name
 	os.MkdirAll(homeDir, 0755)
 	os.Chown(homeDir, u.UID, u.GID)
+}
+
+func upsertSudoers(u user) {
+	path := "/etc/sudoers.d/" + u.Name
+	line := fmt.Sprintf("%s ALL=(ALL) NOPASSWD:ALL\n", u.Name)
+	writeFile(path, line, 0440)
 }
 
 // rewriteOrAppendEvict rewrites any line starting with namePrefix to newLine,
