@@ -145,15 +145,13 @@ func (m *Manager) Create(ctx context.Context, opts CreateOpts) (*state.VMState, 
 	}
 
 	// Resolve extra mounts from config
-	i := 0
-	for hostPath, guestPath := range m.cfg.Mounts.ExtraMounts {
+	for i, m := range m.cfg.Mounts.Dirs {
 		tag := fmt.Sprintf("mnt%d", i)
 		vmState.ExtraMounts = append(vmState.ExtraMounts, state.MountState{
 			Tag:      tag,
-			HostDir:  hostPath,
-			GuestDir: guestPath,
+			HostDir:  m.Src,
+			GuestDir: m.Dest,
 		})
-		i++
 	}
 
 	// Create the qcow2 overlay via the backend
@@ -499,15 +497,13 @@ func (m *Manager) Rebuild(ctx context.Context, id string) (*state.VMState, error
 
 	// Update extra mounts from config
 	vmState.ExtraMounts = nil
-	i := 0
-	for hostPath, guestPath := range m.cfg.Mounts.ExtraMounts {
+	for i, m := range m.cfg.Mounts.Dirs {
 		tag := fmt.Sprintf("mnt%d", i)
 		vmState.ExtraMounts = append(vmState.ExtraMounts, state.MountState{
 			Tag:      tag,
-			HostDir:  hostPath,
-			GuestDir: guestPath,
+			HostDir:  m.Src,
+			GuestDir: m.Dest,
 		})
-		i++
 	}
 
 	// Update users from config

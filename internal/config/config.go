@@ -58,7 +58,12 @@ type PortForward struct {
 
 type MountConfig struct {
 	MountWorkspace bool              `koanf:"mount_workspace"`
-	ExtraMounts    map[string]string `koanf:"-"`
+	Dirs           []ExtraMountEntry `koanf:"dirs"`
+}
+
+type ExtraMountEntry struct {
+	Src  string `koanf:"src"`
+	Dest string `koanf:"dest"`
 }
 
 type CacheConfig struct {
@@ -108,15 +113,6 @@ func Load(projectDir string) (*Config, error) {
 		return nil, err
 	}
 
-	// Populate ExtraMounts from the raw [mounts] map, skipping known scalar keys.
-	cfg.Mounts.ExtraMounts = make(map[string]string)
-	for key, val := range k.StringMap("mounts") {
-		if key == "mount_workspace" {
-			continue
-		}
-		cfg.Mounts.ExtraMounts[key] = val
-	}
-
 	return &cfg, nil
 }
 
@@ -138,7 +134,9 @@ mode = "slirp"
 
 [mounts]
 mount_workspace = true
-# "/host/path" = "/guest/path"
+# [[mounts.dirs]]
+# src = "/host/path"
+# dest = "/guest/path"
 
 [env]
 # KEY = "value"
