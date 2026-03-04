@@ -373,12 +373,15 @@ func run() error {
 	writeEnvProfile(mvmEnv)
 	writeWorkspaceProfile(mvmWS)
 
+	// Start ctrl message dispatcher
+	resizeCh, execCh, shutdownCh := dispatchCtrl(ctrl)
+
 	// Run initial workload
 	exitCode := 0
 	if mvmCmd != "" {
-		exitCode = runWorkload(mvmCmd, shellPath, mvmEnv, mvmUID, mvmUsers, mvmWS)
+		exitCode = runWorkload(mvmCmd, shellPath, mvmEnv, mvmUID, mvmUsers, mvmWS, resizeCh)
 	} else {
-		exitCode = runWorkload(shellPath, shellPath, mvmEnv, mvmUID, mvmUsers, mvmWS)
+		exitCode = runWorkload(shellPath, shellPath, mvmEnv, mvmUID, mvmUsers, mvmWS, resizeCh)
 	}
 	sendMsg(ctrl, proto.Message{Type: proto.TypeExit, Payload: mustJSON(proto.ExitPayload{Code: exitCode})})
 
@@ -387,42 +390,90 @@ func run() error {
 		// No ctrl channel — respawn a shell each time it exits.
 		// The VM stays alive until QEMU is killed externally (mvm stop).
 		for {
-			runWorkload(shellPath, shellPath, mvmEnv, mvmUID, mvmUsers, mvmWS)
+			runWorkload(shellPath, shellPath, mvmEnv, mvmUID, mvmUsers, mvmWS, nil)
 		}
 	}
 
 	// With a working ctrl channel, wait for exec commands from the host.
 	// The VM shuts down when the ctrl channel closes (host disconnects)
 	// or the host sends a shutdown message.
-	dec := json.NewDecoder(ctrl)
 	for {
-		var msg proto.Message
-		if err := dec.Decode(&msg); err != nil {
-			break // ctrl channel closed — shut down
-		}
-		switch msg.Type {
-		case proto.TypeShutdown:
-			break // host requested shutdown
-		case proto.TypeExec:
-			var p proto.ExecPayload
-			json.Unmarshal(msg.Payload, &p)
+		select {
+		case <-shutdownCh:
+			goto shutdown
+		case p, ok := <-execCh:
+			if !ok {
+				goto shutdown
+			}
 			for k, v := range p.Env {
 				mvmEnv[k] = v
 			}
-			code := runWorkload(p.Cmd, shellPath, mvmEnv, mvmUID, mvmUsers, "")
+			code := runWorkload(p.Cmd, shellPath, mvmEnv, mvmUID, mvmUsers, "", resizeCh)
 			sendMsg(ctrl, proto.Message{Type: proto.TypeExit, Payload: mustJSON(proto.ExitPayload{Code: code})})
-			continue
-		default:
-			continue
 		}
-		break
 	}
 
+shutdown:
 	svcManager.StopAll(5 * time.Second)
 
 	syscall.Sync()
 	syscall.Reboot(syscall.LINUX_REBOOT_CMD_POWER_OFF)
 	return nil
+}
+
+// dispatchCtrl reads JSON messages from the ctrl channel in a goroutine and
+// dispatches them to typed channels. Returns channels for resize, exec, and
+// shutdown events. All channels are closed when the ctrl reader exits.
+func dispatchCtrl(ctrl io.ReadWriteCloser) (<-chan proto.ResizePayload, <-chan proto.ExecPayload, <-chan struct{}) {
+	resizeCh := make(chan proto.ResizePayload, 1)
+	execCh := make(chan proto.ExecPayload, 1)
+	shutdownCh := make(chan struct{}, 1)
+
+	go func() {
+		defer close(resizeCh)
+		defer close(execCh)
+		defer func() {
+			select {
+			case shutdownCh <- struct{}{}:
+			default:
+			}
+		}()
+
+		dec := json.NewDecoder(ctrl)
+		for {
+			var msg proto.Message
+			if err := dec.Decode(&msg); err != nil {
+				return // ctrl channel closed
+			}
+			switch msg.Type {
+			case proto.TypeResize:
+				var p proto.ResizePayload
+				json.Unmarshal(msg.Payload, &p)
+				// Non-blocking send; drop stale resize if channel is full
+				select {
+				case resizeCh <- p:
+				default:
+					select {
+					case <-resizeCh:
+					default:
+					}
+					resizeCh <- p
+				}
+			case proto.TypeExec:
+				var p proto.ExecPayload
+				json.Unmarshal(msg.Payload, &p)
+				execCh <- p
+			case proto.TypeShutdown:
+				select {
+				case shutdownCh <- struct{}{}:
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	return resizeCh, execCh, shutdownCh
 }
 
 // resolveShellPath returns the full path for a shell basename by probing
@@ -437,7 +488,7 @@ func resolveShellPath(shell string) string {
 	return "/bin/sh"
 }
 
-func runWorkload(cmd string, shellPath string, env map[string]string, uidGid string, users []user, workdir string) int {
+func runWorkload(cmd string, shellPath string, env map[string]string, uidGid string, users []user, workdir string, resizeCh <-chan proto.ResizePayload) int {
 	parts := strings.Fields(cmd)
 	if len(parts) == 0 {
 		return 0
@@ -533,6 +584,23 @@ func runWorkload(cmd string, shellPath string, env map[string]string, uidGid str
 		close(ptmDone)
 	}()
 
+	// Listen for resize events from the host and apply them to the PTY.
+	if resizeCh != nil {
+		go func() {
+			for {
+				select {
+				case r, ok := <-resizeCh:
+					if !ok {
+						return
+					}
+					pty.Setsize(ptm, &pty.Winsize{Rows: r.Rows, Cols: r.Cols})
+				case <-ptmDone:
+					return
+				}
+			}
+		}()
+	}
+
 	err = c.Wait()
 	// Closing ptm sends EIO to the ptm→stdout goroutine, unblocking its io.Copy.
 	// We wait for it to drain before restoring the terminal to avoid races.
@@ -597,24 +665,6 @@ func runWorkloadNoPTY(parts []string, shellPath string, env map[string]string, u
 		return 1
 	}
 	return 0
-}
-
-func waitForExec(ctrl io.ReadWriteCloser, shellPath string, env map[string]string, uidGid string, users []user) int {
-	dec := json.NewDecoder(ctrl)
-	for {
-		var msg proto.Message
-		if err := dec.Decode(&msg); err != nil {
-			return 1
-		}
-		if msg.Type == proto.TypeExec {
-			var p proto.ExecPayload
-			json.Unmarshal(msg.Payload, &p)
-			for k, v := range p.Env {
-				env[k] = v
-			}
-			return runWorkload(p.Cmd, shellPath, env, uidGid, users, "")
-		}
-	}
 }
 
 type Service struct {

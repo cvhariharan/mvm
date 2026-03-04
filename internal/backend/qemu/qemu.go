@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/term"
+
 	"github.com/cvhariharan/mvm/internal/backend"
 	"github.com/cvhariharan/mvm/internal/proto"
 )
@@ -115,7 +117,28 @@ func (q *QEMU) Start(ctx context.Context, vm *backend.VM, cfg *backend.VMConfig)
 // Returns when the user disconnects (e.g. Ctrl+D, stdin EOF).
 // The VM keeps running — this does NOT wait for the VM to exit.
 func (q *QEMU) Attach(_ context.Context, vm *backend.VM) error {
-	bridgeConsole(vm.ConsoleSocket)
+	q.mu.Lock()
+	rvm := q.running[vm.ID]
+	q.mu.Unlock()
+
+	var sendResizeFn func()
+	if rvm != nil {
+		fd := int(os.Stdin.Fd())
+		sendResizeFn = func() {
+			cols, rows, err := term.GetSize(fd)
+			if err != nil {
+				return
+			}
+			rvm.ctrlMu.Lock()
+			conn := rvm.ctrlConn
+			rvm.ctrlMu.Unlock()
+			if conn != nil {
+				writeResizeMsg(conn, uint16(rows), uint16(cols))
+			}
+		}
+	}
+
+	bridgeConsole(vm.ConsoleSocket, sendResizeFn)
 	return nil
 }
 

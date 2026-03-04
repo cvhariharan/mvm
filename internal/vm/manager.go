@@ -669,6 +669,18 @@ func (m *Manager) ConsolePath(id string) (string, error) {
 	return vmState.ConsolePath, nil
 }
 
+// CtrlPath returns the ctrl socket path for a VM, for use by the attach command.
+func (m *Manager) CtrlPath(id string) (string, error) {
+	vmState, err := m.store.Lookup(id)
+	if err != nil {
+		return "", err
+	}
+	if vmState.Status != state.StatusRunning {
+		return "", fmt.Errorf("vm %s is not running (status: %s)", vmState.ID, vmState.Status)
+	}
+	return vmState.SocketPath, nil
+}
+
 func generateID() (string, error) {
 	b := make([]byte, 4)
 	if _, err := rand.Read(b); err != nil {

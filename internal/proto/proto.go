@@ -31,6 +31,11 @@ type ExecPayload struct {
 	Env map[string]string `json:"env,omitempty"`
 }
 
+type ResizePayload struct {
+	Rows uint16 `json:"rows"`
+	Cols uint16 `json:"cols"`
+}
+
 // Message type constants.
 const (
 	TypeReady    = "ready"
@@ -39,4 +44,5 @@ const (
 	TypeExec     = "exec"
 	TypeError    = "error"
 	TypeShutdown = "shutdown"
+	TypeResize   = "resize"
 )
