@@ -1,6 +1,7 @@
 package rootfs
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -194,8 +195,12 @@ func (b *Builder) createExt4Image(rootfsDir, imagePath string) error {
 	sizeStr := fmt.Sprintf("%dK", size/1024)
 
 	cmd := exec.Command("mke2fs", "-F", "-t", "ext4", "-d", rootfsDir, "-L", "rootfs", imagePath, sizeStr)
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%w: %s", err, stderr.String())
+	}
+	return nil
 }
 
 // dirSize returns the total size in bytes of all files under dir.
