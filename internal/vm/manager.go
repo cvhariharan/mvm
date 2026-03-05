@@ -3,7 +3,9 @@ package vm
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,10 +16,12 @@ import (
 	"time"
 
 	"github.com/cvhariharan/mvm/internal/backend"
+	"github.com/cvhariharan/mvm/internal/backend/qemu"
 	"github.com/cvhariharan/mvm/internal/config"
 	"github.com/cvhariharan/mvm/internal/initrd"
 	"github.com/cvhariharan/mvm/internal/kernel"
 	"github.com/cvhariharan/mvm/internal/rootfs"
+	"github.com/cvhariharan/mvm/internal/sshutil"
 	"github.com/cvhariharan/mvm/internal/state"
 )
 
@@ -95,6 +99,19 @@ func (m *Manager) Create(ctx context.Context, opts CreateOpts) (*state.VMState, 
 	uid := strconv.Itoa(hostUID) + ":" + strconv.Itoa(hostGID)
 	vmDir := m.store.VMDir(id)
 
+	// Generate SSH keypair and allocate port
+	if err := os.MkdirAll(vmDir, 0755); err != nil {
+		return nil, fmt.Errorf("create vm dir: %w", err)
+	}
+	sshKeyPath, _, err := sshutil.GenerateKeyPair(vmDir)
+	if err != nil {
+		return nil, fmt.Errorf("generate ssh key: %w", err)
+	}
+	sshPort, err := qemu.AllocateSSHPort()
+	if err != nil {
+		return nil, fmt.Errorf("allocate ssh port: %w", err)
+	}
+
 	vmState := &state.VMState{
 		ID:        id,
 		Name:      opts.Name,
@@ -107,7 +124,8 @@ func (m *Manager) Create(ctx context.Context, opts CreateOpts) (*state.VMState, 
 		RootfsPath:  rootfsPath,
 		OverlayPath: vmDir + "/" + id + ".qcow2",
 		SocketPath:  vmDir + "/" + id + ".sock",
-		ConsolePath: vmDir + "/" + id + ".console.sock",
+		SSHPort:     sshPort,
+		SSHKeyPath:  sshKeyPath,
 
 		Memory:  m.cfg.VM.Memory,
 		CPUs:    m.cfg.VM.CPUs,
@@ -162,9 +180,7 @@ func (m *Manager) Create(ctx context.Context, opts CreateOpts) (*state.VMState, 
 	}
 
 	if opts.Ephemeral {
-		if err := os.MkdirAll(m.store.VMDir(id), 0755); err != nil {
-			return nil, fmt.Errorf("create vm dir: %w", err)
-		}
+		// VM dir already created for SSH keys above.
 	} else {
 		if err := m.store.Save(vmState); err != nil {
 			return nil, fmt.Errorf("save state: %w", err)
@@ -205,36 +221,28 @@ func (m *Manager) Start(ctx context.Context, id string, foreground bool) (int, e
 		return 0, nil
 	}
 
-	// In foreground mode, race between console detach (Ctrl+]) and
-	// workload exit (Ctrl+D / shell exit). If the workload exits first,
-	// stop the VM so the console socket closes and bridgeConsole returns.
-	consoleDone := make(chan struct{})
+	// Foreground mode: attach blocks until user detaches (Ctrl+]) or
+	// session closes naturally (workload exited / VM stopped).
+	exitCh := make(chan int, 1)
 	go func() {
-		m.backend.Attach(ctx, vm)
-		close(consoleDone)
+		code, _ := m.backend.WaitExit(ctx, vm)
+		exitCh <- code
 	}()
 
-	exitCtx, exitCancel := context.WithCancel(ctx)
-	defer exitCancel()
+	attachErr := m.backend.Attach(ctx, vm, vmState.SSHKeyPath)
 
-	exitDone := make(chan int, 1)
-	go func() {
-		code, _ := m.backend.WaitExit(exitCtx, vm)
-		exitDone <- code
-	}()
-
-	exitCode := 0
-	select {
-	case <-consoleDone:
+	if errors.Is(attachErr, qemu.ErrDetached) {
 		// User detached (Ctrl+]) — VM keeps running.
-		exitCancel()
-	case code := <-exitDone:
-		// Workload exited — stop the VM.
-		exitCode = code
-		m.Stop(ctx, id)
-		<-consoleDone
+		return 0, nil
 	}
 
+	// Session closed naturally — workload exited, stop the VM.
+	var exitCode int
+	select {
+	case exitCode = <-exitCh:
+	case <-time.After(5 * time.Second):
+	}
+	m.Stop(ctx, id)
 	return exitCode, nil
 }
 
@@ -414,31 +422,33 @@ func (m *Manager) Run(ctx context.Context, command string) (int, error) {
 		return 1, fmt.Errorf("start vm: %w", err)
 	}
 
-	type result struct{ code int }
-	exitCh := make(chan result, 2)
-
 	// Wait for guest workload exit via ctrl channel.
+	exitCh := make(chan int, 1)
 	go func() {
 		code, _ := m.backend.WaitExit(ctx, vm)
-		exitCh <- result{code}
+		exitCh <- code
 	}()
 
-	// Bridge console — returns when user detaches (Ctrl+]) or socket closes.
-	go func() {
-		m.backend.Attach(ctx, vm)
-		exitCh <- result{0}
-	}()
+	// SSH session — blocks until user detaches (Ctrl+]) or session closes.
+	m.backend.Attach(ctx, vm, vmState.SSHKeyPath)
 
-	// Whichever happens first (workload done or user detaches) ends the session.
-	res := <-exitCh
+	// After detach/session-close, check if workload already exited.
+	var exitCode int
+	select {
+	case exitCode = <-exitCh:
+		// Workload finished — use its exit code.
+	default:
+		// User detached (Ctrl+]) before workload finished.
+		exitCode = 0
+	}
 
-	// Stop the VM and clean up without touching the store.
+	// Always stop + cleanup for ephemeral VMs.
 	m.backend.Stop(ctx, vm)
 	waitForExit(vm.Pid, 10*time.Second)
 	m.backend.Destroy(ctx, vm)
 	os.RemoveAll(m.store.VMDir(vmState.ID))
 
-	return res.code, nil
+	return exitCode, nil
 }
 
 // Rebuild stops the VM (if running), re-extracts the initrd, and updates the
@@ -472,6 +482,23 @@ func (m *Manager) Rebuild(ctx context.Context, id string) (*state.VMState, error
 	initrdPath, err := initrd.Extract(m.cacheDir + "/initrd")
 	if err != nil {
 		return nil, fmt.Errorf("extract initrd: %w", err)
+	}
+
+	// Regenerate SSH key if missing, re-allocate port.
+	if vmState.SSHKeyPath == "" {
+		vmDir := m.store.VMDir(vmState.ID)
+		keyPath, _, err := sshutil.GenerateKeyPair(vmDir)
+		if err != nil {
+			return nil, fmt.Errorf("generate ssh key: %w", err)
+		}
+		vmState.SSHKeyPath = keyPath
+	}
+	if vmState.SSHPort == 0 {
+		port, err := qemu.AllocateSSHPort()
+		if err != nil {
+			return nil, fmt.Errorf("allocate ssh port: %w", err)
+		}
+		vmState.SSHPort = port
 	}
 
 	// Update state from current config, keeping the same ID, name, and overlay.
@@ -581,6 +608,19 @@ func waitForExit(pid int, timeout time.Duration) {
 	proc.Signal(syscall.SIGKILL)
 }
 
+// readSSHPubKey reads the base64-encoded public key from the VM's key file.
+func readSSHPubKey(keyPath string) string {
+	if keyPath == "" {
+		return ""
+	}
+	pubPath := keyPath + ".pub"
+	data, err := os.ReadFile(pubPath)
+	if err != nil {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(data)
+}
+
 // stateToVMConfig converts persisted state back to the backend VMConfig.
 func stateToVMConfig(s *state.VMState) *backend.VMConfig {
 	var mounts []backend.Mount
@@ -615,6 +655,8 @@ func stateToVMConfig(s *state.VMState) *backend.VMConfig {
 		Shell:       s.Shell,
 		Hostname:    s.Hostname(),
 		Users:       stateUsersToBackend(s.Users),
+		SSHPubKey:   readSSHPubKey(s.SSHKeyPath),
+		SSHPort:     s.SSHPort,
 	}
 }
 
@@ -645,36 +687,24 @@ func stateUsersToBackend(users []state.UserState) []backend.User {
 // stateToVM converts persisted state to the backend VM handle.
 func stateToVM(s *state.VMState) *backend.VM {
 	return &backend.VM{
-		ID:            s.ID,
-		OverlayImg:    s.OverlayPath,
-		CtrlSocket:    s.SocketPath,
-		ConsoleSocket: s.ConsolePath,
-		Pid:           s.Pid,
+		ID:         s.ID,
+		OverlayImg: s.OverlayPath,
+		CtrlSocket: s.SocketPath,
+		SSHPort:    s.SSHPort,
+		Pid:        s.Pid,
 	}
 }
 
-// ConsolePath returns the console socket path for a VM, for use by the attach command.
-func (m *Manager) ConsolePath(id string) (string, error) {
+// SSHInfo returns the SSH port and key path for a running VM.
+func (m *Manager) SSHInfo(id string) (port int, keyPath string, err error) {
 	vmState, err := m.store.Lookup(id)
 	if err != nil {
-		return "", err
+		return 0, "", err
 	}
 	if vmState.Status != state.StatusRunning {
-		return "", fmt.Errorf("vm %s is not running (status: %s)", vmState.ID, vmState.Status)
+		return 0, "", fmt.Errorf("vm %s is not running (status: %s)", vmState.ID, vmState.Status)
 	}
-	return vmState.ConsolePath, nil
-}
-
-// CtrlPath returns the ctrl socket path for a VM, for use by the attach command.
-func (m *Manager) CtrlPath(id string) (string, error) {
-	vmState, err := m.store.Lookup(id)
-	if err != nil {
-		return "", err
-	}
-	if vmState.Status != state.StatusRunning {
-		return "", fmt.Errorf("vm %s is not running (status: %s)", vmState.ID, vmState.Status)
-	}
-	return vmState.SocketPath, nil
+	return vmState.SSHPort, vmState.SSHKeyPath, nil
 }
 
 func generateID() (string, error) {

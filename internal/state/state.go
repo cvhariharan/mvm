@@ -36,8 +36,9 @@ type VMState struct {
 	InitrdPath  string `json:"initrd_path"`
 	RootfsPath  string `json:"rootfs_path"`
 	OverlayPath string `json:"overlay_path"`
-	SocketPath  string `json:"socket_path"`  // control channel
-	ConsolePath string `json:"console_path"` // serial console
+	SocketPath string `json:"socket_path"` // control channel
+	SSHPort    int    `json:"ssh_port,omitempty"`
+	SSHKeyPath string `json:"ssh_key_path,omitempty"`
 
 	// VM configuration (needed to rebuild QEMU args on restart)
 	Memory    string            `json:"memory"`

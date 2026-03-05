@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -12,8 +13,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"golang.org/x/term"
 
 	"github.com/cvhariharan/mvm/internal/backend"
 	"github.com/cvhariharan/mvm/internal/proto"
@@ -58,7 +57,6 @@ func (q *QEMU) Create(ctx context.Context, cfg *backend.VMConfig) (*backend.VM, 
 
 	overlayImg := filepath.Join(overlayDir, cfg.ID+".qcow2")
 	ctrlSocket := filepath.Join(overlayDir, cfg.ID+".sock")
-	consoleSocket := filepath.Join(overlayDir, cfg.ID+".console.sock")
 
 	// Create qcow2 overlay backed by the rootfs
 	cmd := exec.CommandContext(ctx, "qemu-img", "create",
@@ -72,19 +70,18 @@ func (q *QEMU) Create(ctx context.Context, cfg *backend.VMConfig) (*backend.VM, 
 	}
 
 	return &backend.VM{
-		ID:            cfg.ID,
-		OverlayImg:    overlayImg,
-		CtrlSocket:    ctrlSocket,
-		ConsoleSocket: consoleSocket,
+		ID:         cfg.ID,
+		OverlayImg: overlayImg,
+		CtrlSocket: ctrlSocket,
+		SSHPort:    cfg.SSHPort,
 	}, nil
 }
 
 // Start launches the QEMU process and returns immediately.
 // Sets vm.Pid. Call Attach() to bridge the console, or Wait() to get the exit code.
 func (q *QEMU) Start(ctx context.Context, vm *backend.VM, cfg *backend.VMConfig) error {
-	// Remove stale sockets from a previous run
+	// Remove stale socket from a previous run
 	os.Remove(vm.CtrlSocket)
-	os.Remove(vm.ConsoleSocket)
 
 	args := buildArgs(cfg, vm)
 
@@ -95,10 +92,24 @@ func (q *QEMU) Start(ctx context.Context, vm *backend.VM, cfg *backend.VMConfig)
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
+	// Pipe serial console output (boot/install logs) to host stderr.
+	// Use a pipe instead of assigning os.Stderr directly to cmd.Stdout
+	// so QEMU's -serial stdio chardev sees a pipe (not a terminal) and
+	// doesn't alter terminal settings that conflict with SSH raw mode.
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		return fmt.Errorf("stdout pipe: %w", err)
+	}
+
 	if err := cmd.Start(); err != nil {
 		cancel()
 		return fmt.Errorf("start qemu: %w", err)
 	}
+
+	go func() {
+		io.Copy(os.Stderr, stdoutPipe)
+	}()
 	vm.Pid = cmd.Process.Pid
 
 	rvm := &runningVM{cmd: cmd, exitCh: make(chan int, 1), cancel: cancel}
@@ -113,33 +124,11 @@ func (q *QEMU) Start(ctx context.Context, vm *backend.VM, cfg *backend.VMConfig)
 	return nil
 }
 
-// Attach bridges the VM's serial console to the host terminal.
-// Returns when the user disconnects (e.g. Ctrl+D, stdin EOF).
-// The VM keeps running — this does NOT wait for the VM to exit.
-func (q *QEMU) Attach(_ context.Context, vm *backend.VM) error {
-	q.mu.Lock()
-	rvm := q.running[vm.ID]
-	q.mu.Unlock()
-
-	var sendResizeFn func()
-	if rvm != nil {
-		fd := int(os.Stdin.Fd())
-		sendResizeFn = func() {
-			cols, rows, err := term.GetSize(fd)
-			if err != nil {
-				return
-			}
-			rvm.ctrlMu.Lock()
-			conn := rvm.ctrlConn
-			rvm.ctrlMu.Unlock()
-			if conn != nil {
-				writeResizeMsg(conn, uint16(rows), uint16(cols))
-			}
-		}
-	}
-
-	bridgeConsole(vm.ConsoleSocket, sendResizeFn)
-	return nil
+// Attach connects to the VM via SSH and bridges the session to the host terminal.
+// Returns when the user disconnects (Ctrl+]) or the session closes.
+// The VM keeps running.
+func (q *QEMU) Attach(_ context.Context, vm *backend.VM, sshKeyPath string) error {
+	return AttachSSH(vm.SSHPort, sshKeyPath)
 }
 
 // WaitExit blocks until the guest workload sends an exit code on the
@@ -239,6 +228,5 @@ func (q *QEMU) Stop(_ context.Context, vm *backend.VM) error {
 func (q *QEMU) Destroy(_ context.Context, vm *backend.VM) error {
 	os.Remove(vm.OverlayImg)
 	os.Remove(vm.CtrlSocket)
-	os.Remove(vm.ConsoleSocket)
 	return nil
 }

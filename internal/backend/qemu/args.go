@@ -21,11 +21,8 @@ func buildArgs(cfg *backend.VMConfig, vm *backend.VM) []string {
 		"-initrd", cfg.Initrd,
 	}
 
-	// Serial console via unix socket (attach from any process)
-	args = append(args,
-		"-chardev", fmt.Sprintf("socket,id=console,path=%s,server=on,wait=off", vm.ConsoleSocket),
-		"-serial", "chardev:console",
-	)
+	// Serial console to stdio for boot diagnostics (non-interactive)
+	args = append(args, "-serial", "stdio")
 
 	// Root drive (qcow2 overlay)
 	args = append(args,
@@ -40,9 +37,13 @@ func buildArgs(cfg *backend.VMConfig, vm *backend.VM) []string {
 		"-device", "virtserialport,chardev=ctrl,name=mvm.ctrl",
 	)
 
-	// Network
-	if cfg.Network.Mode == "slirp" {
+	// Network — always use slirp for SSH connectivity
+	{
 		netdev := "user,id=net0"
+		// SSH port forward
+		if cfg.SSHPort > 0 {
+			netdev += fmt.Sprintf(",hostfwd=tcp::%d-:2222", cfg.SSHPort)
+		}
 		for _, pf := range cfg.Network.Ports {
 			proto := pf.Protocol
 			if proto == "" {
@@ -111,6 +112,9 @@ func buildCmdline(cfg *backend.VMConfig) string {
 	}
 	if len(cfg.Users) > 0 {
 		parts = append(parts, "mvm.users="+encodeUsers(cfg.Users))
+	}
+	if cfg.SSHPubKey != "" {
+		parts = append(parts, "mvm.sshpub="+cfg.SSHPubKey)
 	}
 
 	return strings.Join(parts, " ")

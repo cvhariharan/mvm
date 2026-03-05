@@ -3,23 +3,28 @@
 package main
 
 import (
+	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/creack/pty"
-	"golang.org/x/term"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/cvhariharan/mvm/internal/proto"
 )
@@ -355,16 +360,14 @@ func run() error {
 
 	createUsers(mvmUsers, shell)
 
+	mvmSSHPub := params["mvm.sshpub"]
+
 	ctrl := openCtrl()
 
 	svcManager := newServiceManager()
 	if err := svcManager.LoadAndStart(servicesConfigPath); err != nil {
 		fmt.Fprintf(os.Stderr, "services: %v\n", err)
 	}
-
-	sendMsg(ctrl, proto.Message{Type: proto.TypeReady, Payload: mustJSON(proto.ReadyPayload{
-		Services: svcManager.RunningNames(),
-	})})
 
 	shellPath := resolveShellPath(shell)
 
@@ -373,47 +376,25 @@ func run() error {
 	writeEnvProfile(mvmEnv)
 	writeWorkspaceProfile(mvmWS)
 
-	// Start ctrl message dispatcher
-	resizeCh, execCh, shutdownCh := dispatchCtrl(ctrl)
-
-	// Run initial workload
-	exitCode := 0
-	if mvmCmd != "" {
-		exitCode = runWorkload(mvmCmd, shellPath, mvmEnv, mvmUID, mvmUsers, mvmWS, resizeCh)
-	} else {
-		exitCode = runWorkload(shellPath, shellPath, mvmEnv, mvmUID, mvmUsers, mvmWS, resizeCh)
-	}
-	sendMsg(ctrl, proto.Message{Type: proto.TypeExit, Payload: mustJSON(proto.ExitPayload{Code: exitCode})})
-
-	// Keep the VM alive after the initial workload exits.
-	if _, ok := ctrl.(nopRWC); ok {
-		// No ctrl channel — respawn a shell each time it exits.
-		// The VM stays alive until QEMU is killed externally (mvm stop).
-		for {
-			runWorkload(shellPath, shellPath, mvmEnv, mvmUID, mvmUsers, mvmWS, nil)
+	// Start embedded SSH server if public key was provided.
+	if mvmSSHPub != "" {
+		if err := startSSHServer(mvmSSHPub, shellPath, mvmEnv, mvmUID, mvmUsers, mvmWS, mvmCmd, ctrl); err != nil {
+			fmt.Fprintf(os.Stderr, "mvm-init: ssh server: %v\n", err)
 		}
 	}
 
-	// With a working ctrl channel, wait for exec commands from the host.
-	// The VM shuts down when the ctrl channel closes (host disconnects)
-	// or the host sends a shutdown message.
-	for {
-		select {
-		case <-shutdownCh:
-			goto shutdown
-		case p, ok := <-execCh:
-			if !ok {
-				goto shutdown
-			}
-			for k, v := range p.Env {
-				mvmEnv[k] = v
-			}
-			code := runWorkload(p.Cmd, shellPath, mvmEnv, mvmUID, mvmUsers, "", resizeCh)
-			sendMsg(ctrl, proto.Message{Type: proto.TypeExit, Payload: mustJSON(proto.ExitPayload{Code: code})})
-		}
-	}
+	sendMsg(ctrl, proto.Message{Type: proto.TypeReady, Payload: mustJSON(proto.ReadyPayload{
+		Services: svcManager.RunningNames(),
+	})})
 
-shutdown:
+	// Start ctrl message dispatcher (shutdown only — exec/resize handled by SSH)
+	shutdownCh := dispatchCtrl(ctrl)
+
+	// Wait for explicit shutdown message from host. If the ctrl channel
+	// disconnects (CLI detach), this blocks forever and the VM keeps
+	// running. mvm stop will SIGTERM the QEMU process to kill the VM.
+	<-shutdownCh
+
 	svcManager.StopAll(5 * time.Second)
 
 	syscall.Sync()
@@ -422,48 +403,21 @@ shutdown:
 }
 
 // dispatchCtrl reads JSON messages from the ctrl channel in a goroutine and
-// dispatches them to typed channels. Returns channels for resize, exec, and
-// shutdown events. All channels are closed when the ctrl reader exits.
-func dispatchCtrl(ctrl io.ReadWriteCloser) (<-chan proto.ResizePayload, <-chan proto.ExecPayload, <-chan struct{}) {
-	resizeCh := make(chan proto.ResizePayload, 1)
-	execCh := make(chan proto.ExecPayload, 1)
+// returns a channel that signals shutdown. The channel receives only when an
+// explicit shutdown message arrives. If the ctrl channel disconnects (e.g.
+// the host CLI detaches), the VM keeps running — a new CLI can reconnect
+// and send a shutdown later, or use SIGTERM.
+func dispatchCtrl(ctrl io.ReadWriteCloser) <-chan struct{} {
 	shutdownCh := make(chan struct{}, 1)
 
 	go func() {
-		defer close(resizeCh)
-		defer close(execCh)
-		defer func() {
-			select {
-			case shutdownCh <- struct{}{}:
-			default:
-			}
-		}()
-
 		dec := json.NewDecoder(ctrl)
 		for {
 			var msg proto.Message
 			if err := dec.Decode(&msg); err != nil {
-				return // ctrl channel closed
+				return // ctrl channel closed — VM keeps running
 			}
-			switch msg.Type {
-			case proto.TypeResize:
-				var p proto.ResizePayload
-				json.Unmarshal(msg.Payload, &p)
-				// Non-blocking send; drop stale resize if channel is full
-				select {
-				case resizeCh <- p:
-				default:
-					select {
-					case <-resizeCh:
-					default:
-					}
-					resizeCh <- p
-				}
-			case proto.TypeExec:
-				var p proto.ExecPayload
-				json.Unmarshal(msg.Payload, &p)
-				execCh <- p
-			case proto.TypeShutdown:
+			if msg.Type == proto.TypeShutdown {
 				select {
 				case shutdownCh <- struct{}{}:
 				default:
@@ -473,7 +427,7 @@ func dispatchCtrl(ctrl io.ReadWriteCloser) (<-chan proto.ResizePayload, <-chan p
 		}
 	}()
 
-	return resizeCh, execCh, shutdownCh
+	return shutdownCh
 }
 
 // resolveShellPath returns the full path for a shell basename by probing
@@ -488,38 +442,221 @@ func resolveShellPath(shell string) string {
 	return "/bin/sh"
 }
 
-func runWorkload(cmd string, shellPath string, env map[string]string, uidGid string, users []user, workdir string, resizeCh <-chan proto.ResizePayload) int {
+// startSSHServer starts an embedded SSH server on :2222 that authenticates
+// with the provided public key. Each session runs a shell or command in a PTY
+// with proper user credentials. The initial command (mvmCmd) is tracked: when
+// the first session completes, its exit code is sent on the ctrl channel.
+func startSSHServer(sshPubB64, shellPath string, env map[string]string, uidGid string, users []user, workdir, mvmCmd string, ctrl io.ReadWriteCloser) error {
+	// Decode the authorized public key.
+	pubBytes, err := base64.StdEncoding.DecodeString(sshPubB64)
+	if err != nil {
+		return fmt.Errorf("decode ssh pub key: %w", err)
+	}
+	authorizedKey, _, _, _, err := ssh.ParseAuthorizedKey(pubBytes)
+	if err != nil {
+		return fmt.Errorf("parse ssh pub key: %w", err)
+	}
+
+	// Generate ephemeral host key.
+	_, hostPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generate host key: %w", err)
+	}
+	hostSigner, err := ssh.NewSignerFromKey(hostPriv)
+	if err != nil {
+		return fmt.Errorf("host signer: %w", err)
+	}
+
+	config := &ssh.ServerConfig{
+		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			if bytes.Equal(key.Marshal(), authorizedKey.Marshal()) {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("unauthorized key")
+		},
+	}
+	config.AddHostKey(hostSigner)
+
+	listener, err := net.Listen("tcp", ":2222")
+	if err != nil {
+		return fmt.Errorf("listen :2222: %w", err)
+	}
+
+	// Track whether the initial command's exit code has been sent.
+	var firstExitOnce sync.Once
+
+	go func() {
+		for {
+			tcpConn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go handleSSHConn(tcpConn, config, shellPath, env, uidGid, users, workdir, mvmCmd, ctrl, &firstExitOnce)
+		}
+	}()
+
+	fmt.Fprintf(os.Stderr, "[mvm] ssh server listening on :2222\n")
+	return nil
+}
+
+func handleSSHConn(tcpConn net.Conn, config *ssh.ServerConfig, shellPath string, env map[string]string, uidGid string, users []user, workdir, mvmCmd string, ctrl io.ReadWriteCloser, firstExitOnce *sync.Once) {
+	defer tcpConn.Close()
+
+	sshConn, chans, reqs, err := ssh.NewServerConn(tcpConn, config)
+	if err != nil {
+		return
+	}
+	defer sshConn.Close()
+
+	go ssh.DiscardRequests(reqs)
+
+	for newChan := range chans {
+		if newChan.ChannelType() != "session" {
+			newChan.Reject(ssh.UnknownChannelType, "unsupported channel type")
+			continue
+		}
+		ch, requests, err := newChan.Accept()
+		if err != nil {
+			continue
+		}
+		go handleSSHSession(ch, requests, shellPath, env, uidGid, users, workdir, mvmCmd, ctrl, firstExitOnce)
+	}
+}
+
+func handleSSHSession(ch ssh.Channel, requests <-chan *ssh.Request, shellPath string, env map[string]string, uidGid string, users []user, workdir, mvmCmd string, ctrl io.ReadWriteCloser, firstExitOnce *sync.Once) {
+	defer ch.Close()
+
+	var ptm, pts *os.File
+	var winSize pty.Winsize
+
+	cmdToRun := mvmCmd
+	isLoginShell := cmdToRun == ""
+
+	for req := range requests {
+		switch req.Type {
+		case "pty-req":
+			// Parse pty-req payload: term(string) + cols(uint32) + rows(uint32) + ...
+			if len(req.Payload) < 4 {
+				if req.WantReply {
+					req.Reply(false, nil)
+				}
+				continue
+			}
+			termLen := binary.BigEndian.Uint32(req.Payload[:4])
+			off := 4 + termLen
+			if uint32(len(req.Payload)) < off+8 {
+				if req.WantReply {
+					req.Reply(false, nil)
+				}
+				continue
+			}
+			cols := binary.BigEndian.Uint32(req.Payload[off:])
+			rows := binary.BigEndian.Uint32(req.Payload[off+4:])
+			winSize = pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)}
+
+			var err error
+			ptm, pts, err = pty.Open()
+			if err != nil {
+				if req.WantReply {
+					req.Reply(false, nil)
+				}
+				continue
+			}
+			pty.Setsize(ptm, &winSize)
+			if req.WantReply {
+				req.Reply(true, nil)
+			}
+
+		case "window-change":
+			if ptm != nil && len(req.Payload) >= 8 {
+				cols := binary.BigEndian.Uint32(req.Payload[:4])
+				rows := binary.BigEndian.Uint32(req.Payload[4:])
+				pty.Setsize(ptm, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})
+			}
+			if req.WantReply {
+				req.Reply(true, nil)
+			}
+
+		case "exec":
+			if len(req.Payload) >= 4 {
+				cmdLen := binary.BigEndian.Uint32(req.Payload[:4])
+				if uint32(len(req.Payload)) >= 4+cmdLen {
+					cmdToRun = string(req.Payload[4 : 4+cmdLen])
+					isLoginShell = false
+				}
+			}
+			if req.WantReply {
+				req.Reply(true, nil)
+			}
+			exitCode := runSSHCommand(ch, ptm, pts, cmdToRun, shellPath, env, uidGid, users, workdir, isLoginShell)
+			firstExitOnce.Do(func() {
+				sendMsg(ctrl, proto.Message{Type: proto.TypeExit, Payload: mustJSON(proto.ExitPayload{Code: exitCode})})
+			})
+			sendExitStatus(ch, uint32(exitCode))
+			return
+
+		case "shell":
+			if req.WantReply {
+				req.Reply(true, nil)
+			}
+			if cmdToRun == "" {
+				cmdToRun = shellPath
+				isLoginShell = true
+			}
+			exitCode := runSSHCommand(ch, ptm, pts, cmdToRun, shellPath, env, uidGid, users, workdir, isLoginShell)
+			firstExitOnce.Do(func() {
+				sendMsg(ctrl, proto.Message{Type: proto.TypeExit, Payload: mustJSON(proto.ExitPayload{Code: exitCode})})
+			})
+			sendExitStatus(ch, uint32(exitCode))
+			return
+
+		case "env":
+			// Accept env requests silently.
+			if req.WantReply {
+				req.Reply(true, nil)
+			}
+
+		default:
+			if req.WantReply {
+				req.Reply(false, nil)
+			}
+		}
+	}
+}
+
+// runSSHCommand runs a command, bridging I/O between the SSH channel and a PTY
+// (if allocated) or direct pipes. Returns the exit code.
+func runSSHCommand(ch ssh.Channel, ptm, pts *os.File, cmd, shellPath string, env map[string]string, uidGid string, users []user, workdir string, isLoginShell bool) int {
 	parts := strings.Fields(cmd)
 	if len(parts) == 0 {
 		return 0
 	}
 
-	// Open a PTY master/slave pair so the child gets a proper controlling terminal.
-	// This enables job control and correct signal delivery (e.g. Ctrl+C → SIGINT).
-	ptm, pts, err := pty.Open()
-	if err != nil {
-		// Fall back to direct I/O if PTY allocation fails.
-		fmt.Fprintf(os.Stderr, "mvm-init: pty open failed (%v), running without pty\n", err)
-		return runWorkloadNoPTY(parts, shellPath, env, uidGid, users, workdir)
-	}
 	c := exec.Command(parts[0], parts[1:]...)
-	// Launch as a login shell when running the user's shell interactively.
-	// Setting argv[0] to "-<name>" is the POSIX convention that tells shells
-	// to source /etc/profile, ~/.profile, etc.
-	if cmd == shellPath && len(parts) == 1 {
+	if isLoginShell && len(parts) == 1 {
 		c.Args[0] = "-" + filepath.Base(shellPath)
 	}
-	c.Stdin = pts
-	c.Stdout = pts
-	c.Stderr = pts
-	c.SysProcAttr = &syscall.SysProcAttr{
-		Setsid:  true,
-		Setctty: true,
-		Ctty:    0, // stdin (fd 0) is pts; TIOCSCTTY is called on it after setsid
+
+	if ptm != nil && pts != nil {
+		c.Stdin = pts
+		c.Stdout = pts
+		c.Stderr = pts
+		c.SysProcAttr = &syscall.SysProcAttr{
+			Setsid:  true,
+			Setctty: true,
+			Ctty:    0,
+		}
+	} else {
+		c.Stdin = ch
+		c.Stdout = ch
+		c.Stderr = ch.Stderr()
 	}
 
 	if uidGid != "" {
 		uid, gid := parseUIDGID(uidGid)
+		if c.SysProcAttr == nil {
+			c.SysProcAttr = &syscall.SysProcAttr{}
+		}
 		c.SysProcAttr.Credential = &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}
 		overrides := map[string]string{}
 		for k, v := range env {
@@ -546,125 +683,32 @@ func runWorkload(cmd string, shellPath string, env map[string]string, uidGid str
 		c.Env = buildEnv(env)
 	}
 
-	// Sync window size from ttyS0 to the PTY slave so the shell knows the
-	// terminal dimensions. Without this, readline falls back to 80x24 defaults
-	// and arrow keys / line editing may misbehave.
-	if ws, err := pty.GetsizeFull(os.Stdin); err == nil {
-		pty.Setsize(ptm, ws)
-	}
-
 	if err := c.Start(); err != nil {
-		pts.Close()
-		ptm.Close()
 		fmt.Fprintf(os.Stderr, "mvm-init: start %s: %v\n", parts[0], err)
 		return 1
 	}
-	// Close slave side in parent after child inherits it.
-	pts.Close()
 
-	// Put ttyS0 into raw mode. term.MakeRaw saves the exact original Termios
-	// state so we can restore it precisely (fixes the old setCooked bug where
-	// canonical flags were hardcoded rather than restored from saved state).
-	stdinFd := int(os.Stdin.Fd())
-	savedState, rawErr := term.MakeRaw(stdinFd)
-	if rawErr != nil {
-		fmt.Fprintf(os.Stderr, "mvm-init: setraw ttyS0: %v\n", rawErr)
+	if ptm != nil && pts != nil {
+		pts.Close()
+		done := make(chan struct{})
+		go func() { io.Copy(ptm, ch); ptm.Close() }()
+		go func() { io.Copy(ch, ptm); close(done) }()
+		c.Wait()
+		<-done
+	} else {
+		c.Wait()
 	}
 
-	// Bridge ttyS0 (os.Stdin/Stdout) ↔ PTY master concurrently.
-	// The stdin→ptm goroutine is intentionally not awaited: os.Stdin is the
-	// VM's ttyS0 serial port which has no EOF, so io.Copy(ptm, os.Stdin) blocks
-	// forever once ptm is closed. It is cleaned up when mvm-init exits.
-	ptmDone := make(chan struct{})
-	go func() {
-		io.Copy(ptm, os.Stdin)
-	}()
-	go func() {
-		io.Copy(os.Stdout, ptm)
-		close(ptmDone)
-	}()
-
-	// Listen for resize events from the host and apply them to the PTY.
-	if resizeCh != nil {
-		go func() {
-			for {
-				select {
-				case r, ok := <-resizeCh:
-					if !ok {
-						return
-					}
-					pty.Setsize(ptm, &pty.Winsize{Rows: r.Rows, Cols: r.Cols})
-				case <-ptmDone:
-					return
-				}
-			}
-		}()
+	if c.ProcessState != nil {
+		return c.ProcessState.ExitCode()
 	}
-
-	err = c.Wait()
-	// Closing ptm sends EIO to the ptm→stdout goroutine, unblocking its io.Copy.
-	// We wait for it to drain before restoring the terminal to avoid races.
-	ptm.Close()
-	<-ptmDone
-
-	// Restore ttyS0 to its original state for any subsequent workload.
-	if savedState != nil {
-		if restoreErr := term.Restore(stdinFd, savedState); restoreErr != nil {
-			fmt.Fprintf(os.Stderr, "mvm-init: restore ttyS0: %v\n", restoreErr)
-		}
-	}
-
-	if err != nil {
-		if exit, ok := err.(*exec.ExitError); ok {
-			return exit.ExitCode()
-		}
-		return 1
-	}
-	return 0
+	return 1
 }
 
-// runWorkloadNoPTY is a fallback that runs the command without a PTY.
-func runWorkloadNoPTY(parts []string, shellPath string, env map[string]string, uidGid string, users []user, workdir string) int {
-	c := exec.Command(parts[0], parts[1:]...)
-	c.Stdin = os.Stdin
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
-	if uidGid != "" {
-		uid, gid := parseUIDGID(uidGid)
-		c.SysProcAttr = &syscall.SysProcAttr{
-			Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)},
-		}
-		overrides := map[string]string{}
-		for k, v := range env {
-			overrides[k] = v
-		}
-		for _, u := range users {
-			if u.UID == uid {
-				overrides["USER"] = u.Name
-				overrides["HOME"] = "/home/" + u.Name
-				overrides["SHELL"] = shellPath
-				if workdir != "" {
-					c.Dir = workdir
-				} else {
-					c.Dir = "/home/" + u.Name
-				}
-				break
-			}
-		}
-		c.Env = buildEnv(overrides)
-	} else {
-		if workdir != "" {
-			c.Dir = workdir
-		}
-		c.Env = buildEnv(env)
-	}
-	if err := c.Run(); err != nil {
-		if exit, ok := err.(*exec.ExitError); ok {
-			return exit.ExitCode()
-		}
-		return 1
-	}
-	return 0
+func sendExitStatus(ch ssh.Channel, code uint32) {
+	payload := make([]byte, 4)
+	binary.BigEndian.PutUint32(payload, code)
+	ch.SendRequest("exit-status", false, payload)
 }
 
 type Service struct {

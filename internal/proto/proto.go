@@ -26,23 +26,11 @@ type LogPayload struct {
 
 // Host -> Guest payloads
 
-type ExecPayload struct {
-	Cmd string            `json:"cmd"`
-	Env map[string]string `json:"env,omitempty"`
-}
-
-type ResizePayload struct {
-	Rows uint16 `json:"rows"`
-	Cols uint16 `json:"cols"`
-}
-
 // Message type constants.
 const (
 	TypeReady    = "ready"
 	TypeExit     = "exit"
 	TypeLog      = "log"
-	TypeExec     = "exec"
 	TypeError    = "error"
 	TypeShutdown = "shutdown"
-	TypeResize   = "resize"
 )

@@ -21,6 +21,8 @@ type VMConfig struct {
 	Shell       string
 	CtrlSocket  string
 	Users       []User
+	SSHPubKey   string
+	SSHPort     int
 }
 
 type User struct {
@@ -55,11 +57,11 @@ type WorkspaceConfig struct {
 
 // VM represents a created VM instance.
 type VM struct {
-	ID            string
-	OverlayImg    string
-	CtrlSocket    string
-	ConsoleSocket string
-	Pid           int
+	ID         string
+	OverlayImg string
+	CtrlSocket string
+	SSHPort    int
+	Pid        int
 }
 
 // Backend is the interface for VM lifecycle management.
@@ -68,7 +70,7 @@ type Backend interface {
 	Available() error
 	Create(ctx context.Context, cfg *VMConfig) (*VM, error)
 	Start(ctx context.Context, vm *VM, cfg *VMConfig) error        // non-blocking: launch VM, set vm.Pid, return
-	Attach(ctx context.Context, vm *VM) error                      // bridge console to terminal; returns when user detaches; VM keeps running
+	Attach(ctx context.Context, vm *VM, sshKeyPath string) error    // connect to VM via SSH; returns when user detaches; VM keeps running
 	WaitExit(ctx context.Context, vm *VM) (int, error)             // block until guest workload exits (ctrl channel); VM may still be running
 	Stop(ctx context.Context, vm *VM) error
 	Destroy(ctx context.Context, vm *VM) error

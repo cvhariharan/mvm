@@ -307,7 +307,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 				return nil
 			}
 			fmt.Printf("Re-attaching to running VM %s...\n", vmState.ID)
-			return qemu.AttachConsole(vmState.ConsolePath, vmState.SocketPath)
+			return qemu.AttachSSH(vmState.SSHPort, vmState.SSHKeyPath)
 
 		case state.StatusCreated, state.StatusStopped:
 			mgr, err := createManager(cfg, workDir)
@@ -478,17 +478,12 @@ func runAttach(cmd *cobra.Command, args []string) error {
 		targetID = vmState.ID
 	}
 
-	consolePath, err := mgr.ConsolePath(targetID)
+	port, keyPath, err := mgr.SSHInfo(targetID)
 	if err != nil {
 		return err
 	}
 
-	ctrlPath, err := mgr.CtrlPath(targetID)
-	if err != nil {
-		return err
-	}
-
-	return qemu.AttachConsole(consolePath, ctrlPath)
+	return qemu.AttachSSH(port, keyPath)
 }
 
 func runDestroy(cmd *cobra.Command, args []string) error {
