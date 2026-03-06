@@ -299,6 +299,11 @@ func runUp(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("lookup workspace VM: %w", err)
 	}
 
+	mgr, err := createManager(cfg, workDir)
+	if err != nil {
+		return err
+	}
+
 	if vmState != nil {
 		switch vmState.Status {
 		case state.StatusRunning:
@@ -307,13 +312,9 @@ func runUp(cmd *cobra.Command, args []string) error {
 				return nil
 			}
 			fmt.Printf("Re-attaching to running VM %s...\n", vmState.ID)
-			return qemu.AttachSSH(vmState.SSHPort, vmState.SSHKeyPath)
+			return mgr.AttachConsole(vmState.ID)
 
 		case state.StatusCreated, state.StatusStopped:
-			mgr, err := createManager(cfg, workDir)
-			if err != nil {
-				return err
-			}
 			fmt.Printf("Starting VM %s...\n", vmState.ID)
 			exitCode, err := mgr.Start(context.Background(), vmState.ID, foreground)
 			if err != nil {
@@ -329,7 +330,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 	}
 
 	// No workspace VM found — create and start a new one.
-	mgr, err := createManager(cfg, workDir)
+	mgr, err = createManager(cfg, workDir)
 	if err != nil {
 		return err
 	}
@@ -478,12 +479,7 @@ func runAttach(cmd *cobra.Command, args []string) error {
 		targetID = vmState.ID
 	}
 
-	port, keyPath, err := mgr.SSHInfo(targetID)
-	if err != nil {
-		return err
-	}
-
-	return qemu.AttachSSH(port, keyPath)
+	return mgr.AttachConsole(targetID)
 }
 
 func runDestroy(cmd *cobra.Command, args []string) error {

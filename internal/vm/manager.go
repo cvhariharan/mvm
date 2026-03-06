@@ -221,15 +221,21 @@ func (m *Manager) Start(ctx context.Context, id string, foreground bool) (int, e
 		return 0, nil
 	}
 
-	// Foreground mode: attach blocks until user detaches (Ctrl+]) or
-	// session closes naturally (workload exited / VM stopped).
+	return m.attachAndWait(ctx, vm, vmState.SSHKeyPath, id)
+}
+
+// attachAndWait attaches to a running VM's SSH console and blocks until the
+// session ends. If the user detaches (Ctrl+]), the VM keeps running and 0 is
+// returned. If the session closes naturally (Ctrl+D / shell exit), the VM is
+// stopped and its exit code is returned.
+func (m *Manager) attachAndWait(ctx context.Context, vm *backend.VM, keyPath, id string) (int, error) {
 	exitCh := make(chan int, 1)
 	go func() {
 		code, _ := m.backend.WaitExit(ctx, vm)
 		exitCh <- code
 	}()
 
-	attachErr := m.backend.Attach(ctx, vm, vmState.SSHKeyPath)
+	attachErr := m.backend.Attach(ctx, vm, keyPath)
 
 	if errors.Is(attachErr, qemu.ErrDetached) {
 		// User detached (Ctrl+]) — VM keeps running.
@@ -705,6 +711,22 @@ func (m *Manager) SSHInfo(id string) (port int, keyPath string, err error) {
 		return 0, "", fmt.Errorf("vm %s is not running (status: %s)", vmState.ID, vmState.Status)
 	}
 	return vmState.SSHPort, vmState.SSHKeyPath, nil
+}
+
+// AttachConsole connects to a running VM's SSH console. A user detach
+// (Ctrl+]) is treated as success — the VM keeps running. If the session
+// closes naturally (Ctrl+D / shell exit), the VM is stopped.
+func (m *Manager) AttachConsole(id string) error {
+	vmState, err := m.store.Lookup(id)
+	if err != nil {
+		return err
+	}
+	if vmState.Status != state.StatusRunning {
+		return fmt.Errorf("vm %s is not running (status: %s)", vmState.ID, vmState.Status)
+	}
+	vm := stateToVM(vmState)
+	_, err = m.attachAndWait(context.Background(), vm, vmState.SSHKeyPath, id)
+	return err
 }
 
 func generateID() (string, error) {

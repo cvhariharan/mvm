@@ -83,7 +83,10 @@ func (q *QEMU) Start(ctx context.Context, vm *backend.VM, cfg *backend.VMConfig)
 	// Remove stale socket from a previous run
 	os.Remove(vm.CtrlSocket)
 
-	args := buildArgs(cfg, vm)
+	args, err := buildArgs(cfg, vm)
+	if err != nil {
+		return err
+	}
 
 	qemuCtx, cancel := context.WithCancel(ctx)
 	cmd := exec.CommandContext(qemuCtx, "qemu-system-x86_64", args...)
@@ -216,7 +219,19 @@ func (q *QEMU) Stop(_ context.Context, vm *backend.VM) error {
 		}
 	}
 
-	// No ctrl channel available — SIGTERM as fallback.
+	// Cross-process: connect to the ctrl socket directly and send shutdown.
+	if vm.CtrlSocket != "" {
+		if conn, err := net.Dial("unix", vm.CtrlSocket); err == nil {
+			msg := proto.Message{Type: proto.TypeShutdown}
+			b, _ := json.Marshal(msg)
+			b = append(b, '\n')
+			conn.Write(b)
+			conn.Close()
+			return nil
+		}
+	}
+
+	// No ctrl channel available — SIGTERM as last resort.
 	if vm.Pid > 0 {
 		if proc, err := os.FindProcess(vm.Pid); err == nil {
 			proc.Signal(syscall.SIGTERM)

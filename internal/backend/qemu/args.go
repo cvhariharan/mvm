@@ -3,12 +3,23 @@ package qemu
 import (
 	"encoding/base64"
 	"fmt"
+	"net"
 	"strings"
 
 	"github.com/cvhariharan/mvm/internal/backend"
 )
 
-func buildArgs(cfg *backend.VMConfig, vm *backend.VM) []string {
+// checkPortFree returns an error if the given host TCP port is already in use.
+func checkPortFree(port int) error {
+	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return fmt.Errorf("host port %d is already in use", port)
+	}
+	l.Close()
+	return nil
+}
+
+func buildArgs(cfg *backend.VMConfig, vm *backend.VM) ([]string, error) {
 	args := []string{
 		"-M", "microvm",
 		"-enable-kvm",
@@ -42,9 +53,15 @@ func buildArgs(cfg *backend.VMConfig, vm *backend.VM) []string {
 		netdev := "user,id=net0"
 		// SSH port forward
 		if cfg.SSHPort > 0 {
+			if err := checkPortFree(cfg.SSHPort); err != nil {
+				return nil, err
+			}
 			netdev += fmt.Sprintf(",hostfwd=tcp::%d-:2222", cfg.SSHPort)
 		}
 		for _, pf := range cfg.Network.Ports {
+			if err := checkPortFree(pf.Host); err != nil {
+				return nil, err
+			}
 			proto := pf.Protocol
 			if proto == "" {
 				proto = "tcp"
@@ -76,7 +93,7 @@ func buildArgs(cfg *backend.VMConfig, vm *backend.VM) []string {
 	// Kernel command line
 	args = append(args, "-append", buildCmdline(cfg))
 
-	return args
+	return args, nil
 }
 
 func buildCmdline(cfg *backend.VMConfig) string {
