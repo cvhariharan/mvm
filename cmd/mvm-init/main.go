@@ -306,6 +306,7 @@ func run() error {
 	mvmShell := params["mvm.shell"]
 	mvmEnv := decodeEnv(params["mvm.env"])
 	mvmMounts := decodeMounts(params["mvm.mounts"])
+	mvmFileMounts := decodeFileMounts(params["mvm.filemounts"])
 	mvmUsers := decodeUsers(params["mvm.users"])
 
 	if isInitrd() {
@@ -329,6 +330,11 @@ func run() error {
 		writeFile("/etc/resolv.conf", "nameserver 10.0.2.3\n", 0644)
 		writeFile("/etc/hosts", "127.0.0.1 localhost\n::1 localhost\n", 0644)
 	}
+
+	// File mounts: mount 9p parent dirs on /run (safe after mountEssential),
+	// bind-mount individual files, then tear down the 9p parents.
+	mountFileParents(mvmFileMounts, "")
+	bindMountFiles(mvmFileMounts)
 
 	shell := userShell(mvmShell)
 
@@ -881,6 +887,12 @@ type extraMount struct {
 	GuestDir string
 }
 
+type fileMount struct {
+	Tag       string
+	FileName  string
+	GuestPath string
+}
+
 func decodeMounts(encoded string) []extraMount {
 	if encoded == "" {
 		return nil
@@ -894,6 +906,24 @@ func decodeMounts(encoded string) []extraMount {
 		parts := strings.SplitN(line, ":", 2)
 		if len(parts) == 2 {
 			mounts = append(mounts, extraMount{Tag: parts[0], GuestDir: parts[1]})
+		}
+	}
+	return mounts
+}
+
+func decodeFileMounts(encoded string) []fileMount {
+	if encoded == "" {
+		return nil
+	}
+	b, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil
+	}
+	var mounts []fileMount
+	for _, line := range strings.Split(string(b), "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) == 3 {
+			mounts = append(mounts, fileMount{Tag: parts[0], FileName: parts[1], GuestPath: parts[2]})
 		}
 	}
 	return mounts
@@ -1056,6 +1086,50 @@ func mountExtra(mounts []extraMount, prefix string) {
 			fmt.Fprintf(os.Stderr, "mount %s at %s: %v\n", m.Tag, target, err)
 		}
 	}
+}
+
+// mountFileParents mounts each unique 9p tag at a hidden location under
+// /run/mvm/fmnt/<tag>/. If prefix is non-empty, paths are joined under it.
+func mountFileParents(mounts []fileMount, prefix string) {
+	seen := map[string]bool{}
+	for _, m := range mounts {
+		if seen[m.Tag] {
+			continue
+		}
+		seen[m.Tag] = true
+		target := filepath.Join(prefix, "/run/mvm/fmnt", m.Tag)
+		os.MkdirAll(target, 0755)
+		if err := syscall.Mount(m.Tag, target, "9p",
+			syscall.MS_NOATIME,
+			"trans=virtio,version=9p2000.L,msize=104857600"); err != nil {
+			fmt.Fprintf(os.Stderr, "mount file parent %s at %s: %v\n", m.Tag, target, err)
+		}
+	}
+}
+
+// bindMountFiles bind-mounts individual files from hidden 9p mounts to their
+// guest destinations, then unmounts the hidden 9p parent mounts so sibling
+// files in the parent directory are inaccessible.
+func bindMountFiles(mounts []fileMount) {
+	for _, m := range mounts {
+		src := filepath.Join("/run/mvm/fmnt", m.Tag, m.FileName)
+		os.MkdirAll(filepath.Dir(m.GuestPath), 0755)
+		// Create empty file at dest so bind mount has a target
+		os.WriteFile(m.GuestPath, nil, 0644)
+		if err := syscall.Mount(src, m.GuestPath, "", syscall.MS_BIND, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "bind mount %s → %s: %v\n", src, m.GuestPath, err)
+		}
+	}
+	// Tear down hidden 9p mounts — bind mounts survive.
+	seen := map[string]bool{}
+	for _, m := range mounts {
+		if seen[m.Tag] {
+			continue
+		}
+		seen[m.Tag] = true
+		syscall.Unmount(filepath.Join("/run/mvm/fmnt", m.Tag), 0)
+	}
+	os.RemoveAll("/run/mvm/fmnt")
 }
 
 func openCtrl() io.ReadWriteCloser {

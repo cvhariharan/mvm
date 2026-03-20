@@ -46,6 +46,7 @@ type VMState struct {
 	Network   NetworkState      `json:"network"`
 	Workspace WorkspaceState    `json:"workspace"`
 	ExtraMounts []MountState      `json:"extra_mounts,omitempty"`
+	FileMounts  []FileMountState  `json:"file_mounts,omitempty"`
 	Env         map[string]string `json:"env,omitempty"`
 	Command     string            `json:"command,omitempty"`
 	UID         string            `json:"uid"`
@@ -64,6 +65,15 @@ type MountState struct {
 	Tag      string `json:"tag"`
 	HostDir  string `json:"host_dir"`
 	GuestDir string `json:"guest_dir"`
+}
+
+// FileMountState describes a persisted host→guest file bind mount.
+// The Tag identifies the 9p mount of the file's parent directory.
+type FileMountState struct {
+	Tag       string `json:"tag"`        // 9p mount tag (e.g. "fmnt0")
+	HostDir   string `json:"host_dir"`   // parent directory on host
+	FileName  string `json:"file_name"`  // basename of source file
+	GuestPath string `json:"guest_path"` // absolute destination in guest
 }
 
 type NetworkState struct {

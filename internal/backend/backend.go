@@ -13,7 +13,8 @@ type VMConfig struct {
 	CPUs        int
 	Network     NetworkConfig
 	Workspace   WorkspaceConfig
-	ExtraMounts []Mount // additional 9p mounts
+	ExtraMounts []Mount     // additional 9p mounts
+	FileMounts  []FileMount // individual file bind mounts
 	Env         map[string]string
 	Command     string
 	UID         string
@@ -36,6 +37,15 @@ type Mount struct {
 	Tag      string // unique 9p mount tag (e.g. "mnt0")
 	HostDir  string // absolute path on host
 	GuestDir string // absolute path inside guest
+}
+
+// FileMount describes a host→guest individual file bind mount.
+// The parent directory is exposed via 9p; the file is bind-mounted in the guest.
+type FileMount struct {
+	Tag       string // unique 9p mount tag (e.g. "fmnt0")
+	HostDir   string // parent directory on host
+	FileName  string // basename of the file
+	GuestPath string // absolute destination path inside guest
 }
 
 type NetworkConfig struct {

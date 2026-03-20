@@ -58,12 +58,13 @@ type PortForward struct {
 
 type MountConfig struct {
 	MountWorkspace bool              `koanf:"mount_workspace"`
-	Dirs           []ExtraMountEntry `koanf:"dirs"`
+	Entries        []ExtraMountEntry `koanf:"entries"`
 }
 
 type ExtraMountEntry struct {
-	Src  string `koanf:"src"`
-	Dest string `koanf:"dest"`
+	Src    string `koanf:"src"`
+	Dest   string `koanf:"dest"`
+	IsFile bool   `koanf:"is_file"`
 }
 
 type CacheConfig struct {
@@ -134,9 +135,13 @@ mode = "slirp"
 
 [mounts]
 mount_workspace = true
-# [[mounts.dirs]]
+# [[mounts.entries]]
 # src = "/host/path"
 # dest = "/guest/path"
+# [[mounts.entries]]
+# src = "/host/path/to/file"
+# dest = "/guest/path/to/file"
+# is_file = true
 
 [env]
 # KEY = "value"

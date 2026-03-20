@@ -90,6 +90,19 @@ func buildArgs(cfg *backend.VMConfig, vm *backend.VM) ([]string, error) {
 		)
 	}
 
+	// File mount 9p shares (deduplicated by tag — files sharing a parent dir reuse one mount)
+	seen := map[string]bool{}
+	for _, fm := range cfg.FileMounts {
+		if seen[fm.Tag] {
+			continue
+		}
+		seen[fm.Tag] = true
+		args = append(args,
+			"-fsdev", fmt.Sprintf("local,id=%s,path=%s,security_model=none", fm.Tag, fm.HostDir),
+			"-device", fmt.Sprintf("virtio-9p-device,fsdev=%s,mount_tag=%s", fm.Tag, fm.Tag),
+		)
+	}
+
 	// Kernel command line
 	args = append(args, "-append", buildCmdline(cfg))
 
@@ -127,6 +140,9 @@ func buildCmdline(cfg *backend.VMConfig) string {
 	if len(cfg.Users) > 0 {
 		parts = append(parts, "mvm.users="+encodeUsers(cfg.Users))
 	}
+	if len(cfg.FileMounts) > 0 {
+		parts = append(parts, "mvm.filemounts="+encodeFileMounts(cfg.FileMounts))
+	}
 	if cfg.SSHPubKey != "" {
 		parts = append(parts, "mvm.sshpub="+cfg.SSHPubKey)
 	}
@@ -147,6 +163,15 @@ func encodeUsers(users []backend.User) string {
 	var lines []string
 	for _, u := range users {
 		lines = append(lines, fmt.Sprintf("%s:%d:%d", u.Name, u.UID, u.GID))
+	}
+	return base64.StdEncoding.EncodeToString([]byte(strings.Join(lines, "\n")))
+}
+
+// encodeFileMounts encodes file mounts as base64("tag:filename:guestpath\n...")
+func encodeFileMounts(mounts []backend.FileMount) string {
+	var lines []string
+	for _, m := range mounts {
+		lines = append(lines, m.Tag+":"+m.FileName+":"+m.GuestPath)
 	}
 	return base64.StdEncoding.EncodeToString([]byte(strings.Join(lines, "\n")))
 }

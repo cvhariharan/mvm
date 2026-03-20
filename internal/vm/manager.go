@@ -161,15 +161,21 @@ func (m *Manager) Create(ctx context.Context, opts CreateOpts) (*state.VMState, 
 		})
 	}
 
-	// Resolve extra mounts from config
-	for i, m := range m.cfg.Mounts.Dirs {
-		tag := fmt.Sprintf("mnt%d", i)
+	// Resolve extra mounts from config (split dirs vs file mounts)
+	dirIdx := 0
+	for _, m := range m.cfg.Mounts.Entries {
+		if m.IsFile {
+			continue
+		}
+		tag := fmt.Sprintf("mnt%d", dirIdx)
 		vmState.ExtraMounts = append(vmState.ExtraMounts, state.MountState{
 			Tag:      tag,
 			HostDir:  m.Src,
 			GuestDir: m.Dest,
 		})
+		dirIdx++
 	}
+	vmState.FileMounts = resolveFileMounts(m.cfg.Mounts.Entries)
 
 	// Create the qcow2 overlay via the backend
 	vmCfg := stateToVMConfig(vmState)
@@ -498,16 +504,23 @@ func (m *Manager) Rebuild(ctx context.Context, id string) (*state.VMState, error
 	}()
 	vmState.Env = mergeTermEnv(m.cfg.Env)
 
-	// Update extra mounts from config
+	// Update extra mounts from config (split dirs vs file mounts)
 	vmState.ExtraMounts = nil
-	for i, m := range m.cfg.Mounts.Dirs {
-		tag := fmt.Sprintf("mnt%d", i)
+	vmState.FileMounts = nil
+	dirIdx := 0
+	for _, m := range m.cfg.Mounts.Entries {
+		if m.IsFile {
+			continue
+		}
+		tag := fmt.Sprintf("mnt%d", dirIdx)
 		vmState.ExtraMounts = append(vmState.ExtraMounts, state.MountState{
 			Tag:      tag,
 			HostDir:  m.Src,
 			GuestDir: m.Dest,
 		})
+		dirIdx++
 	}
+	vmState.FileMounts = resolveFileMounts(m.cfg.Mounts.Entries)
 
 	// Update users from config
 	hostUID := os.Getuid()
@@ -597,6 +610,33 @@ func readSSHPubKey(keyPath string) string {
 	return base64.StdEncoding.EncodeToString(data)
 }
 
+// resolveFileMounts groups file mount entries by parent directory, assigning
+// a shared 9p tag per unique parent to conserve virtio device slots.
+func resolveFileMounts(dirs []config.ExtraMountEntry) []state.FileMountState {
+	parentTags := map[string]string{} // host parent dir → tag
+	fmntIdx := 0
+	var out []state.FileMountState
+	for _, f := range dirs {
+		if !f.IsFile {
+			continue
+		}
+		parentDir := filepath.Dir(f.Src)
+		tag, exists := parentTags[parentDir]
+		if !exists {
+			tag = fmt.Sprintf("fmnt%d", fmntIdx)
+			parentTags[parentDir] = tag
+			fmntIdx++
+		}
+		out = append(out, state.FileMountState{
+			Tag:       tag,
+			HostDir:   parentDir,
+			FileName:  filepath.Base(f.Src),
+			GuestPath: f.Dest,
+		})
+	}
+	return out
+}
+
 // stateToVMConfig converts persisted state back to the backend VMConfig.
 func stateToVMConfig(s *state.VMState) *backend.VMConfig {
 	var mounts []backend.Mount
@@ -625,6 +665,7 @@ func stateToVMConfig(s *state.VMState) *backend.VMConfig {
 			GuestDir: s.Workspace.GuestDir,
 		},
 		ExtraMounts: mounts,
+		FileMounts:  stateFileMountsToBackend(s.FileMounts),
 		Env:         s.Env,
 		Command:     s.Command,
 		UID:         s.UID,
@@ -648,6 +689,19 @@ func statePortsToBackend(ports []state.PortForwardState) []backend.PortForward {
 	out := make([]backend.PortForward, len(ports))
 	for i, p := range ports {
 		out[i] = backend.PortForward{Host: p.Host, Guest: p.Guest, Protocol: p.Protocol}
+	}
+	return out
+}
+
+func stateFileMountsToBackend(mounts []state.FileMountState) []backend.FileMount {
+	var out []backend.FileMount
+	for _, m := range mounts {
+		out = append(out, backend.FileMount{
+			Tag:       m.Tag,
+			HostDir:   m.HostDir,
+			FileName:  m.FileName,
+			GuestPath: m.GuestPath,
+		})
 	}
 	return out
 }
