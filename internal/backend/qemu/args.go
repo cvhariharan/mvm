@@ -106,9 +106,6 @@ func buildCmdline(cfg *backend.VMConfig) string {
 		"rw",
 	}
 
-	if cfg.Command != "" {
-		parts = append(parts, "mvm.cmd="+cfg.Command)
-	}
 	if cfg.UID != "" {
 		parts = append(parts, "mvm.uid="+cfg.UID)
 	}

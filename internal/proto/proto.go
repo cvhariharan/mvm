@@ -15,10 +15,6 @@ type ReadyPayload struct {
 	Services []string `json:"services"`
 }
 
-type ExitPayload struct {
-	Code int `json:"code"`
-}
-
 type LogPayload struct {
 	Stream string `json:"stream"` // "stdout" | "stderr"
 	Data   string `json:"data"`   // base64 encoded
@@ -29,7 +25,6 @@ type LogPayload struct {
 // Message type constants.
 const (
 	TypeReady    = "ready"
-	TypeExit     = "exit"
 	TypeLog      = "log"
 	TypeError    = "error"
 	TypeShutdown = "shutdown"

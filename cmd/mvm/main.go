@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -77,6 +79,18 @@ var attachCmd = &cobra.Command{
 	Short: "Attach to a running microVM's console (no arg = workspace VM)",
 	Args:  cobra.MaximumNArgs(1),
 	RunE:  runAttach,
+}
+
+var (
+	flagSSHCode bool
+	flagSSHZed  bool
+)
+
+var sshCmd = &cobra.Command{
+	Use:   "ssh [id-or-name] [-- <ssh-args...>]",
+	Short: "SSH into a running microVM (or open an editor with --code/--zed)",
+	Args:  cobra.ArbitraryArgs,
+	RunE:  runSSH,
 }
 
 var rmCmd = &cobra.Command{
@@ -201,6 +215,9 @@ func init() {
 	rootCmd.AddCommand(createCmd)
 	rootCmd.AddCommand(startCmd)
 	rootCmd.AddCommand(attachCmd)
+	sshCmd.Flags().BoolVar(&flagSSHCode, "code", false, "open VS Code connected to the VM")
+	sshCmd.Flags().BoolVar(&flagSSHZed, "zed", false, "open Zed connected to the VM")
+	rootCmd.AddCommand(sshCmd)
 	rootCmd.AddCommand(stopCmd)
 	rootCmd.AddCommand(rmCmd)
 	rootCmd.AddCommand(psCmd)
@@ -480,6 +497,200 @@ func runAttach(cmd *cobra.Command, args []string) error {
 	}
 
 	return mgr.AttachConsole(targetID)
+}
+
+// sshConnInfo holds the resolved SSH connection details for a VM.
+type sshConnInfo struct {
+	Port     int
+	KeyPath  string
+	Username string
+	WorkDir  string // guest workspace directory (may be empty)
+}
+
+// resolveSSHInfo resolves SSH connection info for a VM identified by name/ID,
+// falling back to the workspace VM if targetID is empty.
+func resolveSSHInfo(targetID string) (*sshConnInfo, error) {
+	cfg, workDir, err := loadConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	mgr, err := createManager(cfg, workDir)
+	if err != nil {
+		return nil, err
+	}
+
+	if targetID == "" {
+		store, err := state.NewStore()
+		if err != nil {
+			return nil, fmt.Errorf("state store: %w", err)
+		}
+		vmState, err := store.LookupByWorkspace(workDir)
+		if err != nil {
+			return nil, fmt.Errorf("lookup workspace VM: %w", err)
+		}
+		if vmState == nil {
+			return nil, fmt.Errorf("no VM found for workspace %s", workDir)
+		}
+		targetID = vmState.ID
+	}
+
+	port, keyPath, err := mgr.SSHInfo(targetID)
+	if err != nil {
+		return nil, err
+	}
+
+	store, err := state.NewStore()
+	if err != nil {
+		return nil, fmt.Errorf("state store: %w", err)
+	}
+	vmState, err := store.Lookup(targetID)
+	if err != nil {
+		return nil, err
+	}
+	username := "root"
+	if len(vmState.Users) > 0 {
+		username = vmState.Users[0].Name
+	}
+
+	return &sshConnInfo{
+		Port:     port,
+		KeyPath:  keyPath,
+		Username: username,
+		WorkDir:  vmState.Workspace.GuestDir,
+	}, nil
+}
+
+// sshHostStr returns "user@127.0.0.1" for the connection.
+func (s *sshConnInfo) sshHostStr() string {
+	return fmt.Sprintf("%s@127.0.0.1", s.Username)
+}
+
+// baseSSHArgs returns the common SSH flags for connecting to the VM.
+func (s *sshConnInfo) baseSSHArgs() []string {
+	return []string{
+		"-i", s.KeyPath,
+		"-p", fmt.Sprintf("%d", s.Port),
+		"-o", "IdentitiesOnly=yes",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "LogLevel=ERROR",
+	}
+}
+
+func runSSH(cmd *cobra.Command, args []string) error {
+	// Split args at "--" into target ID and extra SSH args.
+	var targetID string
+	var extraArgs []string
+	for i, a := range args {
+		if a == "--" {
+			extraArgs = args[i+1:]
+			break
+		}
+		if targetID == "" {
+			targetID = a
+		}
+	}
+
+	info, err := resolveSSHInfo(targetID)
+	if err != nil {
+		return err
+	}
+
+	// Write SSH config for editor integrations (also useful for manual ssh).
+	if _, err := writeSSHConfig(info); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not write ssh config: %v\n", err)
+	}
+
+	remoteDir := info.WorkDir
+	if remoteDir == "" {
+		remoteDir = "/home/" + info.Username
+	}
+
+	if flagSSHCode {
+		codeBin, err := exec.LookPath("code")
+		if err != nil {
+			return fmt.Errorf("code (VS Code) not found in PATH")
+		}
+		c := exec.Command(codeBin,
+			"--remote", fmt.Sprintf("ssh-remote+mvm %s", remoteDir),
+		)
+		c.Stdout = os.Stdout
+		c.Stderr = os.Stderr
+		return c.Run()
+	}
+
+	if flagSSHZed {
+		zedBin, err := exec.LookPath("zed")
+		if err != nil {
+			return fmt.Errorf("zed not found in PATH")
+		}
+		c := exec.Command(zedBin, fmt.Sprintf("ssh://mvm%s", remoteDir))
+		c.Stdout = os.Stdout
+		c.Stderr = os.Stderr
+		return c.Run()
+	}
+
+	// Default: interactive SSH session.
+	sshBin, err := exec.LookPath("ssh")
+	if err != nil {
+		return fmt.Errorf("ssh not found in PATH")
+	}
+
+	sshArgs := []string{"ssh"}
+	sshArgs = append(sshArgs, info.baseSSHArgs()...)
+	sshArgs = append(sshArgs, info.sshHostStr())
+	sshArgs = append(sshArgs, extraArgs...)
+
+	return syscall.Exec(sshBin, sshArgs, os.Environ())
+}
+
+// writeSSHConfig writes an SSH config file for the VM so that editors can
+// connect using the host alias "mvm". Returns the config file path.
+func writeSSHConfig(info *sshConnInfo) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	configDir := filepath.Join(home, ".ssh", "mvm")
+	if err := os.MkdirAll(configDir, 0700); err != nil {
+		return "", err
+	}
+
+	configPath := filepath.Join(configDir, "config")
+	content := fmt.Sprintf(`Host mvm
+    HostName 127.0.0.1
+    Port %d
+    User %s
+    IdentityFile %s
+    IdentitiesOnly yes
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+`, info.Port, info.Username, info.KeyPath)
+
+	if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
+		return "", err
+	}
+
+	// Also append an Include directive to ~/.ssh/config if not already present.
+	mainConfig := filepath.Join(home, ".ssh", "config")
+	includeLine := "Include mvm/config"
+	existing, _ := os.ReadFile(mainConfig)
+	if !strings.Contains(string(existing), includeLine) {
+		f, err := os.OpenFile(mainConfig, os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return configPath, nil // non-fatal
+		}
+		defer f.Close()
+		// Include must be at the top of the file.
+		newContent := includeLine + "\n" + string(existing)
+		f.Truncate(0)
+		f.Seek(0, 0)
+		f.WriteString(newContent)
+	}
+
+	return configPath, nil
 }
 
 func runDestroy(cmd *cobra.Command, args []string) error {

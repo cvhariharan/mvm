@@ -21,7 +21,6 @@ import (
 // runningVM tracks a QEMU process launched by this CLI invocation.
 type runningVM struct {
 	cmd      *exec.Cmd
-	exitCh   chan int
 	cancel   context.CancelFunc
 	ctrlConn net.Conn
 	ctrlMu   sync.Mutex
@@ -115,7 +114,7 @@ func (q *QEMU) Start(ctx context.Context, vm *backend.VM, cfg *backend.VMConfig)
 	}()
 	vm.Pid = cmd.Process.Pid
 
-	rvm := &runningVM{cmd: cmd, exitCh: make(chan int, 1), cancel: cancel}
+	rvm := &runningVM{cmd: cmd, cancel: cancel}
 
 	q.mu.Lock()
 	q.running[vm.ID] = rvm
@@ -128,28 +127,9 @@ func (q *QEMU) Start(ctx context.Context, vm *backend.VM, cfg *backend.VMConfig)
 }
 
 // Attach connects to the VM via SSH and bridges the session to the host terminal.
-// Returns when the user disconnects (Ctrl+]) or the session closes.
-// The VM keeps running.
-func (q *QEMU) Attach(_ context.Context, vm *backend.VM, sshKeyPath string) error {
-	return AttachSSH(vm.SSHPort, sshKeyPath)
-}
-
-// WaitExit blocks until the guest workload sends an exit code on the
-// control channel. The VM itself may still be running after this returns.
-func (q *QEMU) WaitExit(ctx context.Context, vm *backend.VM) (int, error) {
-	q.mu.Lock()
-	rvm, ok := q.running[vm.ID]
-	q.mu.Unlock()
-	if !ok {
-		return 1, fmt.Errorf("vm %s is not running in this process", vm.ID)
-	}
-
-	select {
-	case code := <-rvm.exitCh:
-		return code, nil
-	case <-ctx.Done():
-		return 1, ctx.Err()
-	}
+// Returns the exit code when the SSH session ends. The VM keeps running.
+func (q *QEMU) Attach(_ context.Context, vm *backend.VM, sshKeyPath, username, command string) (int, error) {
+	return AttachSSH(vm.SSHPort, sshKeyPath, username, command)
 }
 
 func (q *QEMU) manageCtrl(rvm *runningVM, socketPath string) {
@@ -185,14 +165,6 @@ func (q *QEMU) manageCtrl(rvm *runningVM, socketPath string) {
 			continue
 		}
 		switch msg.Type {
-		case proto.TypeExit:
-			var p proto.ExitPayload
-			json.Unmarshal(msg.Payload, &p)
-			// Forward exit code but keep connection alive for shutdown.
-			select {
-			case rvm.exitCh <- p.Code:
-			default:
-			}
 		case proto.TypeReady:
 			// VM is ready, continue reading
 		}

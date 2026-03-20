@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -221,35 +220,18 @@ func (m *Manager) Start(ctx context.Context, id string, foreground bool) (int, e
 		return 0, nil
 	}
 
-	return m.attachAndWait(ctx, vm, vmState.SSHKeyPath, id)
+	username := "root"
+	if len(vmState.Users) > 0 {
+		username = vmState.Users[0].Name
+	}
+	return m.attachAndWait(ctx, vm, vmState.SSHKeyPath, username, id)
 }
 
 // attachAndWait attaches to a running VM's SSH console and blocks until the
-// session ends. If the user detaches (Ctrl+]), the VM keeps running and 0 is
-// returned. If the session closes naturally (Ctrl+D / shell exit), the VM is
-// stopped and its exit code is returned.
-func (m *Manager) attachAndWait(ctx context.Context, vm *backend.VM, keyPath, id string) (int, error) {
-	exitCh := make(chan int, 1)
-	go func() {
-		code, _ := m.backend.WaitExit(ctx, vm)
-		exitCh <- code
-	}()
-
-	attachErr := m.backend.Attach(ctx, vm, keyPath)
-
-	if errors.Is(attachErr, qemu.ErrDetached) {
-		// User detached (Ctrl+]) — VM keeps running.
-		return 0, nil
-	}
-
-	// Session closed naturally — workload exited, stop the VM.
-	var exitCode int
-	select {
-	case exitCode = <-exitCh:
-	case <-time.After(5 * time.Second):
-	}
-	m.Stop(ctx, id)
-	return exitCode, nil
+// session ends. The VM keeps running after the session closes — shutdown
+// only happens via explicit `mvm stop` or `poweroff` inside the guest.
+func (m *Manager) attachAndWait(ctx context.Context, vm *backend.VM, keyPath, username, id string) (int, error) {
+	return m.backend.Attach(ctx, vm, keyPath, username, "")
 }
 
 // Stop initiates a graceful VM shutdown and returns immediately. A background
@@ -428,25 +410,13 @@ func (m *Manager) Run(ctx context.Context, command string) (int, error) {
 		return 1, fmt.Errorf("start vm: %w", err)
 	}
 
-	// Wait for guest workload exit via ctrl channel.
-	exitCh := make(chan int, 1)
-	go func() {
-		code, _ := m.backend.WaitExit(ctx, vm)
-		exitCh <- code
-	}()
-
-	// SSH session — blocks until user detaches (Ctrl+]) or session closes.
-	m.backend.Attach(ctx, vm, vmState.SSHKeyPath)
-
-	// After detach/session-close, check if workload already exited.
-	var exitCode int
-	select {
-	case exitCode = <-exitCh:
-		// Workload finished — use its exit code.
-	default:
-		// User detached (Ctrl+]) before workload finished.
-		exitCode = 0
+	username := "root"
+	if len(vmState.Users) > 0 {
+		username = vmState.Users[0].Name
 	}
+
+	// SSH session — run the command and get exit code directly.
+	exitCode, _ := m.backend.Attach(ctx, vm, vmState.SSHKeyPath, username, command)
 
 	// Always stop + cleanup for ephemeral VMs.
 	m.backend.Stop(ctx, vm)
@@ -713,9 +683,8 @@ func (m *Manager) SSHInfo(id string) (port int, keyPath string, err error) {
 	return vmState.SSHPort, vmState.SSHKeyPath, nil
 }
 
-// AttachConsole connects to a running VM's SSH console. A user detach
-// (Ctrl+]) is treated as success — the VM keeps running. If the session
-// closes naturally (Ctrl+D / shell exit), the VM is stopped.
+// AttachConsole connects to a running VM's SSH console. The VM keeps
+// running after the session closes.
 func (m *Manager) AttachConsole(id string) error {
 	vmState, err := m.store.Lookup(id)
 	if err != nil {
@@ -724,8 +693,12 @@ func (m *Manager) AttachConsole(id string) error {
 	if vmState.Status != state.StatusRunning {
 		return fmt.Errorf("vm %s is not running (status: %s)", vmState.ID, vmState.Status)
 	}
+	username := "root"
+	if len(vmState.Users) > 0 {
+		username = vmState.Users[0].Name
+	}
 	vm := stateToVM(vmState)
-	_, err = m.attachAndWait(context.Background(), vm, vmState.SSHKeyPath, id)
+	_, err = m.backend.Attach(context.Background(), vm, vmState.SSHKeyPath, username, "")
 	return err
 }
 

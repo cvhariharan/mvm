@@ -3,8 +3,6 @@
 package main
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -16,14 +14,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unsafe"
-
-	"github.com/creack/pty"
-	glssh "github.com/gliderlabs/ssh"
-	gossh "golang.org/x/crypto/ssh"
 
 	"github.com/cvhariharan/mvm/internal/proto"
 )
@@ -126,6 +119,7 @@ var pkgNames = map[pkgManager]map[string]string{
 		"curl":       "curl",
 		"wget":       "wget",
 		"procps":     "procps-ng",
+		"openssh":    "openssh",
 	},
 	pkgManagerAptGet: {
 		"shadow":     "passwd",
@@ -135,6 +129,7 @@ var pkgNames = map[pkgManager]map[string]string{
 		"curl":       "curl",
 		"wget":       "wget",
 		"procps":     "procps",
+		"openssh":    "openssh-server",
 	},
 	pkgManagerDnf: {
 		"shadow":     "shadow-utils",
@@ -144,6 +139,7 @@ var pkgNames = map[pkgManager]map[string]string{
 		"curl":       "curl",
 		"wget":       "wget",
 		"procps":     "procps-ng",
+		"openssh":    "openssh-server",
 	},
 	pkgManagerMicrodnf: {
 		"shadow":     "shadow-utils",
@@ -153,6 +149,7 @@ var pkgNames = map[pkgManager]map[string]string{
 		"curl":       "curl",
 		"wget":       "wget",
 		"procps":     "procps-ng",
+		"openssh":    "openssh-server",
 	},
 	pkgManagerPacman: {
 		"shadow":     "shadow",
@@ -162,6 +159,7 @@ var pkgNames = map[pkgManager]map[string]string{
 		"curl":       "curl",
 		"wget":       "wget",
 		"procps":     "procps-ng",
+		"openssh":    "openssh",
 	},
 	pkgManagerEmerge: {
 		"shadow":     "sys-apps/shadow",
@@ -171,6 +169,7 @@ var pkgNames = map[pkgManager]map[string]string{
 		"curl":       "net-misc/curl",
 		"wget":       "net-misc/wget",
 		"procps":     "sys-process/procps",
+		"openssh":    "net-misc/openssh",
 	},
 }
 
@@ -248,7 +247,7 @@ func installShellAndTools(pm pkgManager, shell string) (string, error) {
 	}
 
 	// Build the list of tool packages for this distro.
-	tools := []string{"shadow", "sudo", "findutils", "util-linux", "curl", "wget", "procps"}
+	tools := []string{"shadow", "sudo", "findutils", "util-linux", "curl", "wget", "procps", "openssh"}
 	var pkgs []string
 	for _, t := range tools {
 		if n, ok := names[t]; ok {
@@ -302,8 +301,6 @@ func run() error {
 	}
 	params := parseCmdline(string(cmdline))
 
-	mvmCmd := params["mvm.cmd"]
-	mvmUID := params["mvm.uid"]
 	mvmWS := params["mvm.ws"]
 	mvmHostname := params["mvm.hostname"]
 	mvmShell := params["mvm.shell"]
@@ -368,18 +365,14 @@ func run() error {
 		fmt.Fprintf(os.Stderr, "services: %v\n", err)
 	}
 
-	shellPath := resolveShellPath(shell)
-
 	// Write env vars and workspace cd to /etc/profile.d/ so login shells
 	// source them automatically — works with any shell, no `su` needed.
 	writeEnvProfile(mvmEnv)
 	writeWorkspaceProfile(mvmWS)
 
-	// Start embedded SSH server if public key was provided.
-	if mvmSSHPub != "" {
-		if err := startSSHServer(mvmSSHPub, shellPath, mvmEnv, mvmUID, mvmUsers, mvmWS, mvmCmd, ctrl); err != nil {
-			fmt.Fprintf(os.Stderr, "mvm-init: ssh server: %v\n", err)
-		}
+	// Configure and start OpenSSH sshd.
+	if err := setupSSHD(mvmSSHPub, mvmUsers); err != nil {
+		fmt.Fprintf(os.Stderr, "mvm-init: sshd setup: %v\n", err)
 	}
 
 	sendMsg(ctrl, proto.Message{Type: proto.TypeReady, Payload: mustJSON(proto.ReadyPayload{
@@ -441,152 +434,86 @@ func resolveShellPath(shell string) string {
 	return "/bin/sh"
 }
 
-// startSSHServer starts an embedded SSH server on :2222 that authenticates
-// with the provided public key. Each session runs a shell or command in a PTY
-// with proper user credentials. The initial command (mvmCmd) is tracked: when
-// the first session completes, its exit code is sent on the ctrl channel.
-func startSSHServer(sshPubB64, shellPath string, env map[string]string, uidGid string, users []user, workdir, mvmCmd string, ctrl io.ReadWriteCloser) error {
-	// Decode the authorized public key.
+// setupSSHD configures and starts an OpenSSH sshd server. It writes
+// sshd_config, generates host keys, places authorized_keys for each user,
+// and starts the sshd daemon.
+func setupSSHD(sshPubB64 string, users []user) error {
+	if sshPubB64 == "" {
+		return nil
+	}
+
+	// Decode the authorized public key from base64. The encoded value is
+	// already in OpenSSH authorized_keys format (e.g. "ssh-ed25519 AAAA...\n").
 	pubBytes, err := base64.StdEncoding.DecodeString(sshPubB64)
 	if err != nil {
 		return fmt.Errorf("decode ssh pub key: %w", err)
 	}
-	authorizedKey, _, _, _, err := glssh.ParseAuthorizedKey(pubBytes)
-	if err != nil {
-		return fmt.Errorf("parse ssh pub key: %w", err)
+	authorizedLine := strings.TrimSpace(string(pubBytes))
+
+	// Write sshd_config.
+	sshdConfig := `Port 2222
+PermitRootLogin no
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+X11Forwarding no
+PrintMotd no
+AcceptEnv LANG LC_* TERM COLORTERM
+`
+	writeFile("/etc/ssh/sshd_config", sshdConfig, 0644)
+
+	// Ensure privilege separation directory exists with correct ownership.
+	os.MkdirAll("/var/empty", 0755)
+	os.Chown("/var/empty", 0, 0)
+
+	// Generate host keys if not already present.
+	if _, err := os.Stat("/etc/ssh/ssh_host_ed25519_key"); err != nil {
+		cmd := exec.Command("/usr/bin/ssh-keygen", "-A")
+		cmd.Stdout = os.Stderr
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("ssh-keygen -A: %w", err)
+		}
 	}
 
-	// Generate ephemeral host key.
-	_, hostPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return fmt.Errorf("generate host key: %w", err)
+	// Place authorized_keys for each user.
+	for _, u := range users {
+		sshDir := "/home/" + u.Name + "/.ssh"
+		os.MkdirAll(sshDir, 0700)
+		os.Chown(sshDir, u.UID, u.GID)
+		akPath := sshDir + "/authorized_keys"
+		os.WriteFile(akPath, []byte(authorizedLine+"\n"), 0600)
+		os.Chown(akPath, u.UID, u.GID)
 	}
-	hostSigner, err := gossh.NewSignerFromKey(hostPriv)
-	if err != nil {
-		return fmt.Errorf("host signer: %w", err)
+
+	// Create /run/sshd (required by some distros).
+	os.MkdirAll("/run/sshd", 0755)
+
+	// Find and start sshd.
+	sshdPath := findBin("sshd", "/usr/sbin/sshd", "/usr/bin/sshd", "/sbin/sshd")
+	if sshdPath == "" {
+		return fmt.Errorf("sshd binary not found")
 	}
 
-	// Track whether the initial command's exit code has been sent.
-	var firstExitOnce sync.Once
-
-	srv := &glssh.Server{
-		Addr: ":2222",
-		PublicKeyHandler: func(ctx glssh.Context, key glssh.PublicKey) bool {
-			return glssh.KeysEqual(key, authorizedKey)
-		},
-		Handler: func(s glssh.Session) {
-			// Determine command: client exec > mvmCmd default > login shell.
-			parts := s.Command()
-			isLoginShell := false
-			if len(parts) == 0 {
-				if mvmCmd != "" {
-					parts = strings.Fields(mvmCmd)
-				} else {
-					parts = []string{shellPath}
-					isLoginShell = true
-				}
-			}
-			if len(parts) == 0 {
-				s.Exit(0)
-				return
-			}
-
-			c := exec.Command(parts[0], parts[1:]...)
-			if isLoginShell {
-				c.Args[0] = "-" + filepath.Base(shellPath)
-			}
-
-			// Set credentials, env, workdir.
-			if uidGid != "" {
-				uid, gid := parseUIDGID(uidGid)
-				if c.SysProcAttr == nil {
-					c.SysProcAttr = &syscall.SysProcAttr{}
-				}
-				c.SysProcAttr.Credential = &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}
-				overrides := map[string]string{}
-				for k, v := range env {
-					overrides[k] = v
-				}
-				for _, u := range users {
-					if u.UID == uid {
-						overrides["USER"] = u.Name
-						overrides["HOME"] = "/home/" + u.Name
-						overrides["SHELL"] = shellPath
-						if workdir != "" {
-							c.Dir = workdir
-						} else {
-							c.Dir = "/home/" + u.Name
-						}
-						break
-					}
-				}
-				c.Env = buildEnv(overrides)
-			} else {
-				if workdir != "" {
-					c.Dir = workdir
-				}
-				c.Env = buildEnv(env)
-			}
-
-			ptyReq, winCh, isPty := s.Pty()
-			if isPty {
-				ptm, pts, err := pty.Open()
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "mvm-init: open pty: %v\n", err)
-					s.Exit(1)
-					return
-				}
-				pty.Setsize(ptm, &pty.Winsize{Rows: uint16(ptyReq.Window.Height), Cols: uint16(ptyReq.Window.Width)})
-				c.Stdin, c.Stdout, c.Stderr = pts, pts, pts
-				if c.SysProcAttr == nil {
-					c.SysProcAttr = &syscall.SysProcAttr{}
-				}
-				c.SysProcAttr.Setsid = true
-				c.SysProcAttr.Setctty = true
-				c.SysProcAttr.Ctty = 0
-				if err := c.Start(); err != nil {
-					pts.Close()
-					ptm.Close()
-					fmt.Fprintf(os.Stderr, "mvm-init: start %s: %v\n", parts[0], err)
-					s.Exit(1)
-					return
-				}
-				pts.Close()
-				go func() {
-					for win := range winCh {
-						pty.Setsize(ptm, &pty.Winsize{Rows: uint16(win.Height), Cols: uint16(win.Width)})
-					}
-				}()
-				done := make(chan struct{})
-				go func() { io.Copy(ptm, s); ptm.Close() }()
-				go func() { io.Copy(s, ptm); close(done) }()
-				c.Wait()
-				<-done
-			} else {
-				c.Stdin, c.Stdout, c.Stderr = s, s, s.Stderr()
-				if err := c.Start(); err != nil {
-					fmt.Fprintf(os.Stderr, "mvm-init: start %s: %v\n", parts[0], err)
-					s.Exit(1)
-					return
-				}
-				c.Wait()
-			}
-
-			exitCode := 1
-			if c.ProcessState != nil {
-				exitCode = c.ProcessState.ExitCode()
-			}
-			firstExitOnce.Do(func() {
-				sendMsg(ctrl, proto.Message{Type: proto.TypeExit, Payload: mustJSON(proto.ExitPayload{Code: exitCode})})
-			})
-			s.Exit(exitCode)
-		},
+	cmd := exec.Command(sshdPath)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start sshd: %w", err)
 	}
-	srv.AddHostKey(hostSigner)
-	go srv.ListenAndServe()
 
-	fmt.Fprintf(os.Stderr, "[mvm] ssh server listening on :2222\n")
+	fmt.Fprintf(os.Stderr, "[mvm] sshd listening on :2222\n")
 	return nil
+}
+
+// findBin returns the first path that exists, or "" if none found.
+func findBin(name string, paths ...string) string {
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
 }
 
 type Service struct {
@@ -929,40 +856,6 @@ func waitForDevice(path string, timeout time.Duration) error {
 func writeFile(path, content string, mode os.FileMode) {
 	os.MkdirAll(filepath.Dir(path), 0755)
 	os.WriteFile(path, []byte(content), mode)
-}
-
-func buildEnv(extra map[string]string) []string {
-	// Build override set for fast lookup.
-	overrideKeys := make(map[string]bool, len(extra))
-	for k := range extra {
-		overrideKeys[strings.ToUpper(k)] = true
-	}
-	// Start from the inherited environment, skipping keys that will be overridden.
-	var env []string
-	for _, kv := range os.Environ() {
-		idx := strings.IndexByte(kv, '=')
-		if idx < 0 {
-			continue
-		}
-		key := kv[:idx]
-		if !overrideKeys[strings.ToUpper(key)] {
-			env = append(env, kv)
-		}
-	}
-	for k, v := range extra {
-		env = append(env, k+"="+v)
-	}
-	return env
-}
-
-func parseUIDGID(s string) (int, int) {
-	parts := strings.SplitN(s, ":", 2)
-	uid, _ := strconv.Atoi(parts[0])
-	gid := uid
-	if len(parts) == 2 {
-		gid, _ = strconv.Atoi(parts[1])
-	}
-	return uid, gid
 }
 
 func decodeEnv(encoded string) map[string]string {

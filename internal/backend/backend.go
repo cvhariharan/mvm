@@ -69,9 +69,8 @@ type Backend interface {
 	Name() string
 	Available() error
 	Create(ctx context.Context, cfg *VMConfig) (*VM, error)
-	Start(ctx context.Context, vm *VM, cfg *VMConfig) error        // non-blocking: launch VM, set vm.Pid, return
-	Attach(ctx context.Context, vm *VM, sshKeyPath string) error    // connect to VM via SSH; returns when user detaches; VM keeps running
-	WaitExit(ctx context.Context, vm *VM) (int, error)             // block until guest workload exits (ctrl channel); VM may still be running
+	Start(ctx context.Context, vm *VM, cfg *VMConfig) error                              // non-blocking: launch VM, set vm.Pid, return
+	Attach(ctx context.Context, vm *VM, sshKeyPath, username, command string) (int, error) // connect to VM via SSH; returns exit code when session ends; VM keeps running
 	Stop(ctx context.Context, vm *VM) error
 	Destroy(ctx context.Context, vm *VM) error
 }

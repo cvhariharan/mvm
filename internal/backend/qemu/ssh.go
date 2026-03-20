@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -15,23 +14,22 @@ import (
 	"golang.org/x/term"
 )
 
-// ErrDetached is returned by AttachSSH when the user presses Ctrl+].
-var ErrDetached = errors.New("user detached")
-
 // AttachSSH connects to a VM via SSH and bridges the session to the host
-// terminal. Blocks until the user detaches (Ctrl+]) or the session closes.
-func AttachSSH(port int, keyPath string) error {
+// terminal. If command is non-empty it is executed; otherwise an interactive
+// shell is started. Returns the remote exit code when the session ends.
+// The VM keeps running after this returns.
+func AttachSSH(port int, keyPath, username, command string) (int, error) {
 	keyData, err := os.ReadFile(keyPath)
 	if err != nil {
-		return fmt.Errorf("read ssh key: %w", err)
+		return 1, fmt.Errorf("read ssh key: %w", err)
 	}
 	signer, err := ssh.ParsePrivateKey(keyData)
 	if err != nil {
-		return fmt.Errorf("parse ssh key: %w", err)
+		return 1, fmt.Errorf("parse ssh key: %w", err)
 	}
 
 	config := &ssh.ClientConfig{
-		User:            "root",
+		User:            username,
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         5 * time.Second,
@@ -50,16 +48,32 @@ func AttachSSH(port int, keyPath string) error {
 		time.Sleep(100 * time.Millisecond)
 	}
 	if client == nil {
-		return fmt.Errorf("ssh connect to %s: %w", addr, err)
+		return 1, fmt.Errorf("ssh connect to %s: %w", addr, err)
 	}
 	defer client.Close()
 
 	session, err := client.NewSession()
 	if err != nil {
-		return fmt.Errorf("ssh session: %w", err)
+		return 1, fmt.Errorf("ssh session: %w", err)
 	}
 	defer session.Close()
 
+	// Non-interactive command execution.
+	if command != "" {
+		session.Stdout = os.Stdout
+		session.Stderr = os.Stderr
+		session.Stdin = os.Stdin
+		if err := session.Run(command); err != nil {
+			var exitErr *ssh.ExitError
+			if errors.As(err, &exitErr) {
+				return exitErr.ExitStatus(), nil
+			}
+			return 1, err
+		}
+		return 0, nil
+	}
+
+	// Interactive shell with PTY.
 	fd := int(os.Stdin.Fd())
 	cols, rows, _ := term.GetSize(fd)
 	if cols == 0 {
@@ -74,7 +88,7 @@ func AttachSSH(port int, keyPath string) error {
 		ssh.TTY_OP_ISPEED: 14400,
 		ssh.TTY_OP_OSPEED: 14400,
 	}); err != nil {
-		return fmt.Errorf("request pty: %w", err)
+		return 1, fmt.Errorf("request pty: %w", err)
 	}
 
 	oldState, err := term.MakeRaw(fd)
@@ -84,16 +98,14 @@ func AttachSSH(port int, keyPath string) error {
 
 	stdin, err := session.StdinPipe()
 	if err != nil {
-		return fmt.Errorf("stdin pipe: %w", err)
+		return 1, fmt.Errorf("stdin pipe: %w", err)
 	}
 	session.Stdout = os.Stdout
 	session.Stderr = os.Stderr
 
 	if err := session.Shell(); err != nil {
-		return fmt.Errorf("start shell: %w", err)
+		return 1, fmt.Errorf("start shell: %w", err)
 	}
-
-	fmt.Fprintf(os.Stdout, "Connected to VM. Press Ctrl+] to detach.\r\n")
 
 	// Forward SIGWINCH to SSH session.
 	sigCh := make(chan os.Signal, 1)
@@ -108,48 +120,21 @@ func AttachSSH(port int, keyPath string) error {
 	}()
 	defer signal.Stop(sigCh)
 
-	// stdin → session with Ctrl+] escape detection.
-	// When copyUntilEscape returns, close the session to unblock Wait().
-	var detached atomic.Bool
+	// stdin → session (plain copy, no escape detection).
 	go func() {
-		copyUntilEscape(stdin, os.Stdin)
-		detached.Store(true)
+		io.Copy(stdin, os.Stdin)
 		stdin.Close()
-		session.Close()
 	}()
 
-	session.Wait()
-	if detached.Load() {
-		return ErrDetached
+	err = session.Wait()
+	if err == nil {
+		return 0, nil
 	}
-	return nil
-}
-
-// copyUntilEscape copies from src to dst, returning when Ctrl+] (0x1d) is
-// pressed, the source closes, or a write to dst fails.
-func copyUntilEscape(dst io.Writer, src io.Reader) error {
-	buf := make([]byte, 4096)
-	for {
-		n, err := src.Read(buf)
-		for i := 0; i < n; i++ {
-			if buf[i] == 0x1d { // Ctrl+]
-				if i > 0 {
-					if _, werr := dst.Write(buf[:i]); werr != nil {
-						return werr
-					}
-				}
-				return nil
-			}
-		}
-		if n > 0 {
-			if _, werr := dst.Write(buf[:n]); werr != nil {
-				return werr
-			}
-		}
-		if err != nil {
-			return err
-		}
+	var exitErr *ssh.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitStatus(), nil
 	}
+	return 1, nil
 }
 
 // AllocateSSHPort finds an available TCP port on localhost.
