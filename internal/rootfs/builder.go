@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -66,7 +65,6 @@ func (b *Builder) build(ctx context.Context, imageName string) (string, error) {
 	}
 	defer os.RemoveAll(workDir)
 
-	rootfsDir := filepath.Join(workDir, "rootfs")
 	rootfsTar := filepath.Join(workDir, "rootfs.tar")
 	rootfsImg := filepath.Join(workDir, rootfsFilename)
 
@@ -84,19 +82,8 @@ func (b *Builder) build(ctx context.Context, imageName string) (string, error) {
 		return "", err
 	}
 
-	if err := os.MkdirAll(rootfsDir, 0755); err != nil {
-		return "", err
-	}
-
-	bar := newSpinner("Extracting rootfs")
-	if err := extractTar(rootfsTar, rootfsDir); err != nil {
-		bar.Close()
-		return "", err
-	}
-	bar.Finish()
-
-	bar = newSpinner("Building ext4 image")
-	if err := b.createExt4Image(rootfsDir, rootfsImg); err != nil {
+	bar := newSpinner("Building ext4 image")
+	if err := b.createExt4Image(rootfsTar, rootfsImg); err != nil {
 		bar.Close()
 		return "", err
 	}
@@ -183,8 +170,8 @@ func (b *Builder) removeContainer(ctx context.Context, containerID string) {
 	b.client.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{Force: true})
 }
 
-func (b *Builder) createExt4Image(rootfsDir, imagePath string) error {
-	size := dirSize(rootfsDir)
+func (b *Builder) createExt4Image(tarPath, imagePath string) error {
+	size := tarSize(tarPath)
 	// Double for ext4 metadata, journal, and inodes; minimum 2GB.
 	size = size * 2
 	minSize := int64(2) << 30
@@ -194,7 +181,7 @@ func (b *Builder) createExt4Image(rootfsDir, imagePath string) error {
 	// mke2fs expects size in KiB when using the K suffix.
 	sizeStr := fmt.Sprintf("%dK", size/1024)
 
-	cmd := exec.Command("mke2fs", "-F", "-t", "ext4", "-d", rootfsDir, "-L", "rootfs", imagePath, sizeStr)
+	cmd := exec.Command("mke2fs", "-F", "-t", "ext4", "-d", tarPath, "-L", "rootfs", imagePath, sizeStr)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -203,24 +190,12 @@ func (b *Builder) createExt4Image(rootfsDir, imagePath string) error {
 	return nil
 }
 
-// dirSize returns the total size in bytes of all files under dir.
-func dirSize(dir string) int64 {
-	var total int64
-	filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		if info, err := d.Info(); err == nil {
-			total += info.Size()
-		}
-		return nil
-	})
-	return total
-}
-
-func extractTar(tarPath, destDir string) error {
-	cmd := exec.Command("tar", "-xf", tarPath, "-C", destDir)
-	return cmd.Run()
+// tarSize returns the size of the tar file on disk.
+func tarSize(tarPath string) int64 {
+	if info, err := os.Stat(tarPath); err == nil {
+		return info.Size()
+	}
+	return 0
 }
 
 func copyFile(src, dst string) error {

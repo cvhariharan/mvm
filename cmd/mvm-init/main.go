@@ -308,6 +308,7 @@ func run() error {
 	mvmMounts := decodeMounts(params["mvm.mounts"])
 	mvmFileMounts := decodeFileMounts(params["mvm.filemounts"])
 	mvmUsers := decodeUsers(params["mvm.users"])
+	mvmServices := params["mvm.services"]
 
 	if isInitrd() {
 		rootDev := params["root"]
@@ -365,6 +366,12 @@ func run() error {
 	mvmSSHPub := params["mvm.sshpub"]
 
 	ctrl := openCtrl()
+
+	if mvmServices != "" {
+		if err := writeServicesConfig(mvmServices, servicesConfigPath); err != nil {
+			fmt.Fprintf(os.Stderr, "[mvm] write services config: %v\n", err)
+		}
+	}
 
 	svcManager := newServiceManager()
 	if err := svcManager.LoadAndStart(servicesConfigPath); err != nil {
@@ -666,6 +673,19 @@ func (sm *ServiceManager) StopAll(timeout time.Duration) {
 			}
 		}
 	}
+}
+
+// writeServicesConfig decodes a base64-encoded INI blob from the kernel
+// cmdline and writes it to path (creating parent dirs as needed).
+func writeServicesConfig(encoded, path string) error {
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return fmt.Errorf("decode: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
 }
 
 func parseINI(path string) (map[string]map[string]string, error) {

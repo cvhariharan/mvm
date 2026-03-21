@@ -146,6 +146,9 @@ func buildCmdline(cfg *backend.VMConfig) string {
 	if cfg.SSHPubKey != "" {
 		parts = append(parts, "mvm.sshpub="+cfg.SSHPubKey)
 	}
+	if len(cfg.Services) > 0 {
+		parts = append(parts, "mvm.services="+encodeServices(cfg.Services))
+	}
 
 	return strings.Join(parts, " ")
 }
@@ -174,6 +177,27 @@ func encodeFileMounts(mounts []backend.FileMount) string {
 		lines = append(lines, m.Tag+":"+m.FileName+":"+m.GuestPath)
 	}
 	return base64.StdEncoding.EncodeToString([]byte(strings.Join(lines, "\n")))
+}
+
+// encodeServices encodes services as base64 INI text ready to be written to
+// /etc/mvm/services.ini inside the guest.
+func encodeServices(svcs []backend.Service) string {
+	var b strings.Builder
+	for _, s := range svcs {
+		fmt.Fprintf(&b, "[service.%s]\n", s.Name)
+		fmt.Fprintf(&b, "cmd=%s\n", s.Cmd)
+		if s.OneShot {
+			fmt.Fprintf(&b, "oneshot=true\n")
+		}
+		if s.Restart {
+			fmt.Fprintf(&b, "restart=always\n")
+		}
+		if s.After != "" {
+			fmt.Fprintf(&b, "after=%s\n", s.After)
+		}
+		fmt.Fprintln(&b)
+	}
+	return base64.StdEncoding.EncodeToString([]byte(b.String()))
 }
 
 // encodeMounts encodes extra mounts as base64("tag:guestpath\ntag:guestpath\n...")

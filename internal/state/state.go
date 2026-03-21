@@ -52,6 +52,15 @@ type VMState struct {
 	UID         string            `json:"uid"`
 	Shell       string            `json:"shell,omitempty"`
 	Users       []UserState       `json:"users,omitempty"`
+	Services    []ServiceState    `json:"services,omitempty"`
+}
+
+type ServiceState struct {
+	Name    string `json:"name"`
+	Cmd     string `json:"cmd"`
+	OneShot bool   `json:"oneshot,omitempty"`
+	Restart bool   `json:"restart,omitempty"`
+	After   string `json:"after,omitempty"`
 }
 
 type UserState struct {

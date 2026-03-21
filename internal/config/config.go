@@ -22,12 +22,21 @@ const (
 )
 
 type Config struct {
-	VM      VMConfig          `koanf:"vm"`
-	Network NetworkConfig     `koanf:"network"`
-	Mounts  MountConfig       `koanf:"mounts"`
-	Cache   CacheConfig       `koanf:"cache"`
-	Env     map[string]string `koanf:"env"`
-	Users   []UserConfig      `koanf:"users"`
+	VM       VMConfig          `koanf:"vm"`
+	Network  NetworkConfig     `koanf:"network"`
+	Mounts   MountConfig       `koanf:"mounts"`
+	Cache    CacheConfig       `koanf:"cache"`
+	Env      map[string]string `koanf:"env"`
+	Users    []UserConfig      `koanf:"users"`
+	Services []ServiceConfig   `koanf:"services"`
+}
+
+type ServiceConfig struct {
+	Name    string `koanf:"name"`
+	Cmd     string `koanf:"cmd"`
+	OneShot bool   `koanf:"oneshot"`
+	Restart bool   `koanf:"restart"`
+	After   string `koanf:"after"`
 }
 
 type UserConfig struct {
@@ -145,6 +154,13 @@ mount_workspace = true
 
 [env]
 # KEY = "value"
+
+# [[services]]
+# name = "dockerd"
+# cmd = "/usr/bin/dockerd"
+# restart = true
+# # oneshot = false
+# # after = "other-service"
 `
 	return os.WriteFile(path, []byte(content), 0644)
 }

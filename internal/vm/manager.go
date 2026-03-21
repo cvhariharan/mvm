@@ -176,6 +176,7 @@ func (m *Manager) Create(ctx context.Context, opts CreateOpts) (*state.VMState, 
 		dirIdx++
 	}
 	vmState.FileMounts = resolveFileMounts(m.cfg.Mounts.Entries)
+	vmState.Services = configServicesToState(m.cfg.Services)
 
 	// Create the qcow2 overlay via the backend
 	vmCfg := stateToVMConfig(vmState)
@@ -521,6 +522,7 @@ func (m *Manager) Rebuild(ctx context.Context, id string) (*state.VMState, error
 		dirIdx++
 	}
 	vmState.FileMounts = resolveFileMounts(m.cfg.Mounts.Entries)
+	vmState.Services = configServicesToState(m.cfg.Services)
 
 	// Update users from config
 	hostUID := os.Getuid()
@@ -674,6 +676,7 @@ func stateToVMConfig(s *state.VMState) *backend.VMConfig {
 		Users:       stateUsersToBackend(s.Users),
 		SSHPubKey:   readSSHPubKey(s.SSHKeyPath),
 		SSHPort:     s.SSHPort,
+		Services:    stateServicesToBackend(s.Services),
 	}
 }
 
@@ -762,6 +765,34 @@ func generateID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+func configServicesToState(svcs []config.ServiceConfig) []state.ServiceState {
+	out := make([]state.ServiceState, len(svcs))
+	for i, s := range svcs {
+		out[i] = state.ServiceState{
+			Name:    s.Name,
+			Cmd:     s.Cmd,
+			OneShot: s.OneShot,
+			Restart: s.Restart,
+			After:   s.After,
+		}
+	}
+	return out
+}
+
+func stateServicesToBackend(svcs []state.ServiceState) []backend.Service {
+	out := make([]backend.Service, len(svcs))
+	for i, s := range svcs {
+		out[i] = backend.Service{
+			Name:    s.Name,
+			Cmd:     s.Cmd,
+			OneShot: s.OneShot,
+			Restart: s.Restart,
+			After:   s.After,
+		}
+	}
+	return out
 }
 
 // mergeTermEnv returns a copy of env with TERM and COLORTERM forwarded from

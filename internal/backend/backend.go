@@ -24,6 +24,15 @@ type VMConfig struct {
 	Users       []User
 	SSHPubKey   string
 	SSHPort     int
+	Services    []Service
+}
+
+type Service struct {
+	Name    string
+	Cmd     string
+	OneShot bool
+	Restart bool
+	After   string
 }
 
 type User struct {
