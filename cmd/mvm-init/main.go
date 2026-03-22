@@ -24,7 +24,7 @@ import (
 const (
 	ctrlPortName       = "mvm.ctrl"
 	newRoot            = "/newroot"
-	servicesConfigPath = "/etc/mvm/services.ini"
+	servicesConfigPath = "/etc/supervisord.conf"
 )
 
 type pkgManager int
@@ -367,25 +367,25 @@ func run() error {
 
 	ctrl := openCtrl()
 
-	if mvmServices != "" {
-		if err := writeServicesConfig(mvmServices, servicesConfigPath); err != nil {
-			fmt.Fprintf(os.Stderr, "[mvm] write services config: %v\n", err)
-		}
-	}
-
-	svcManager := newServiceManager()
-	if err := svcManager.LoadAndStart(servicesConfigPath); err != nil {
-		fmt.Fprintf(os.Stderr, "services: %v\n", err)
-	}
-
 	// Write env vars and workspace cd to /etc/profile.d/ so login shells
 	// source them automatically — works with any shell, no `su` needed.
 	writeEnvProfile(mvmEnv)
 	writeWorkspaceProfile(mvmWS)
 
-	// Configure and start OpenSSH sshd.
-	if err := setupSSHD(mvmSSHPub, mvmUsers); err != nil {
+	// Configure sshd (keys, config) before writing supervisord config so
+	// we can include it as a managed service.
+	sshdPath, err := configureSSHD(mvmSSHPub, mvmUsers)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "mvm-init: sshd setup: %v\n", err)
+	}
+
+	if err := writeServicesConfig(mvmServices, sshdPath, servicesConfigPath); err != nil {
+		fmt.Fprintf(os.Stderr, "[mvm] write services config: %v\n", err)
+	}
+
+	svcManager := newSupervisordManager()
+	if err := svcManager.Start(servicesConfigPath); err != nil {
+		fmt.Fprintf(os.Stderr, "services: %v\n", err)
 	}
 
 	sendMsg(ctrl, proto.Message{Type: proto.TypeReady, Payload: mustJSON(proto.ReadyPayload{
@@ -447,23 +447,20 @@ func resolveShellPath(shell string) string {
 	return "/bin/sh"
 }
 
-// setupSSHD configures and starts an OpenSSH sshd server. It writes
-// sshd_config, generates host keys, places authorized_keys for each user,
-// and starts the sshd daemon.
-func setupSSHD(sshPubB64 string, users []user) error {
+// configureSSHD sets up OpenSSH sshd configuration: writes sshd_config,
+// generates host keys, and places authorized_keys for each user. It returns
+// the path to the sshd binary so the caller can start it (e.g. via supervisord).
+func configureSSHD(sshPubB64 string, users []user) (string, error) {
 	if sshPubB64 == "" {
-		return nil
+		return "", nil
 	}
 
-	// Decode the authorized public key from base64. The encoded value is
-	// already in OpenSSH authorized_keys format (e.g. "ssh-ed25519 AAAA...\n").
 	pubBytes, err := base64.StdEncoding.DecodeString(sshPubB64)
 	if err != nil {
-		return fmt.Errorf("decode ssh pub key: %w", err)
+		return "", fmt.Errorf("decode ssh pub key: %w", err)
 	}
 	authorizedLine := strings.TrimSpace(string(pubBytes))
 
-	// Write sshd_config.
 	sshdConfig := `Port 2222
 PermitRootLogin no
 PubkeyAuthentication yes
@@ -475,21 +472,18 @@ AcceptEnv LANG LC_* TERM COLORTERM
 `
 	writeFile("/etc/ssh/sshd_config", sshdConfig, 0644)
 
-	// Ensure privilege separation directory exists with correct ownership.
 	os.MkdirAll("/var/empty", 0755)
 	os.Chown("/var/empty", 0, 0)
 
-	// Generate host keys if not already present.
 	if _, err := os.Stat("/etc/ssh/ssh_host_ed25519_key"); err != nil {
 		cmd := exec.Command("/usr/bin/ssh-keygen", "-A")
 		cmd.Stdout = os.Stderr
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("ssh-keygen -A: %w", err)
+			return "", fmt.Errorf("ssh-keygen -A: %w", err)
 		}
 	}
 
-	// Place authorized_keys for each user.
 	for _, u := range users {
 		sshDir := "/home/" + u.Name + "/.ssh"
 		os.MkdirAll(sshDir, 0700)
@@ -499,24 +493,14 @@ AcceptEnv LANG LC_* TERM COLORTERM
 		os.Chown(akPath, u.UID, u.GID)
 	}
 
-	// Create /run/sshd (required by some distros).
 	os.MkdirAll("/run/sshd", 0755)
 
-	// Find and start sshd.
 	sshdPath := findBin("sshd", "/usr/sbin/sshd", "/usr/bin/sshd", "/sbin/sshd")
 	if sshdPath == "" {
-		return fmt.Errorf("sshd binary not found")
+		return "", fmt.Errorf("sshd binary not found")
 	}
 
-	cmd := exec.Command(sshdPath)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start sshd: %w", err)
-	}
-
-	fmt.Fprintf(os.Stderr, "[mvm] sshd listening on :2222\n")
-	return nil
+	return sshdPath, nil
 }
 
 // findBin returns the first path that exists, or "" if none found.
@@ -529,191 +513,94 @@ func findBin(name string, paths ...string) string {
 	return ""
 }
 
-type Service struct {
-	Name    string
-	Cmd     string
-	OneShot bool
-	Restart bool
-	After   []string
-	proc    *exec.Cmd
+type supervisordManager struct {
+	cmd   *exec.Cmd
+	names []string
 }
 
-type ServiceManager struct {
-	services map[string]*Service
-	running  []string
+func newSupervisordManager() *supervisordManager {
+	return &supervisordManager{}
 }
 
-func newServiceManager() *ServiceManager {
-	return &ServiceManager{services: map[string]*Service{}}
-}
-
-func (sm *ServiceManager) LoadAndStart(cfgPath string) error {
+func (sm *supervisordManager) Start(cfgPath string) error {
 	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
 		return nil
 	}
 
-	sections, err := parseINI(cfgPath)
+	// Parse program names from the config.
+	data, err := os.ReadFile(cfgPath)
 	if err != nil {
-		return fmt.Errorf("parse %s: %w", cfgPath, err)
+		return fmt.Errorf("read %s: %w", cfgPath, err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[program:") && strings.HasSuffix(line, "]") {
+			name := line[len("[program:") : len(line)-1]
+			sm.names = append(sm.names, name)
+		}
 	}
 
-	for name, kv := range sections {
-		if !strings.HasPrefix(name, "service.") {
-			continue
-		}
-		svcName := strings.TrimPrefix(name, "service.")
-		svc := &Service{
-			Name:    svcName,
-			Cmd:     kv["cmd"],
-			OneShot: kv["oneshot"] == "true",
-			Restart: kv["restart"] == "always",
-		}
-		if after := kv["after"]; after != "" {
-			svc.After = strings.Split(after, ",")
-		}
-		sm.services[svcName] = svc
-	}
-
-	return sm.startOrdered()
-}
-
-func (sm *ServiceManager) startOrdered() error {
-	started := map[string]bool{}
-	var startService func(name string) error
-
-	startService = func(name string) error {
-		if started[name] {
-			return nil
-		}
-		svc, ok := sm.services[name]
-		if !ok {
-			return fmt.Errorf("unknown service: %s", name)
-		}
-		for _, dep := range svc.After {
-			if err := startService(strings.TrimSpace(dep)); err != nil {
-				return err
-			}
-		}
-		started[name] = true
-		return sm.launch(svc)
-	}
-
-	for name := range sm.services {
-		if err := startService(name); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (sm *ServiceManager) launch(svc *Service) error {
-	parts := strings.Fields(svc.Cmd)
-	if len(parts) == 0 {
-		return nil
-	}
-	c := exec.Command(parts[0], parts[1:]...)
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
-	c.Env = os.Environ()
-
-	if err := c.Start(); err != nil {
-		return fmt.Errorf("start service %s: %w", svc.Name, err)
-	}
-	svc.proc = c
-
-	if svc.OneShot {
-		if err := c.Wait(); err != nil {
-			return fmt.Errorf("oneshot service %s failed: %w", svc.Name, err)
-		}
+	if len(sm.names) == 0 {
 		return nil
 	}
 
-	sm.running = append(sm.running, svc.Name)
-	if svc.Restart {
-		go sm.watch(svc)
+	sm.cmd = exec.Command("/usr/bin/supervisord", "-c", cfgPath)
+	sm.cmd.Stdout = os.Stderr
+	sm.cmd.Stderr = os.Stderr
+	sm.cmd.Env = os.Environ()
+
+	if err := sm.cmd.Start(); err != nil {
+		return fmt.Errorf("start supervisord: %w", err)
 	}
+	fmt.Fprintf(os.Stderr, "[mvm] supervisord started with %d service(s)\n", len(sm.names))
 	return nil
 }
 
-func (sm *ServiceManager) watch(svc *Service) {
-	backoff := time.Second
-	for {
-		svc.proc.Wait()
-		time.Sleep(backoff)
-		if backoff < 30*time.Second {
-			backoff *= 2
-		}
-		sm.launch(svc)
-	}
-}
+func (sm *supervisordManager) RunningNames() []string { return sm.names }
 
-func (sm *ServiceManager) RunningNames() []string { return sm.running }
-
-func (sm *ServiceManager) StopAll(timeout time.Duration) {
-	for _, svc := range sm.services {
-		if svc.proc != nil && svc.proc.Process != nil {
-			svc.proc.Process.Signal(syscall.SIGTERM)
-		}
+func (sm *supervisordManager) StopAll(timeout time.Duration) {
+	if sm.cmd == nil || sm.cmd.Process == nil {
+		return
 	}
+	sm.cmd.Process.Signal(syscall.SIGTERM)
 	done := make(chan struct{})
 	go func() {
-		for _, svc := range sm.services {
-			if svc.proc != nil {
-				svc.proc.Wait()
-			}
-		}
+		sm.cmd.Wait()
 		close(done)
 	}()
 	select {
 	case <-done:
 	case <-time.After(timeout):
-		for _, svc := range sm.services {
-			if svc.proc != nil && svc.proc.Process != nil {
-				svc.proc.Process.Kill()
-			}
-		}
+		sm.cmd.Process.Kill()
 	}
 }
 
-// writeServicesConfig decodes a base64-encoded INI blob from the kernel
-// cmdline and writes it to path (creating parent dirs as needed).
-func writeServicesConfig(encoded, path string) error {
-	data, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		return fmt.Errorf("decode: %w", err)
-	}
+// writeServicesConfig builds a supervisord config file at path. It includes
+// a [supervisord] header, an sshd program (if sshdPath is non-empty), and
+// any user-defined services decoded from the base64-encoded blob.
+func writeServicesConfig(encoded, sshdPath, path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
-}
 
-func parseINI(path string) (map[string]map[string]string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
+	var b strings.Builder
+	b.WriteString("[unix_http_server]\nfile=/var/run/supervisord.sock\n\n")
+	b.WriteString("[supervisord]\nnodaemon=true\nlogfile=/var/log/supervisord.log\nlogfile_maxbytes=0\n\n")
+	b.WriteString("[supervisorctl]\nserverurl=unix:///var/run/supervisord.sock\n\n")
+
+	if sshdPath != "" {
+		fmt.Fprintf(&b, "[program:sshd]\ncommand=%s -D\nautostart=true\nautorestart=true\n\n", sshdPath)
 	}
-	sections := map[string]map[string]string{}
-	var current string
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || line[0] == '#' || line[0] == ';' {
-			continue
+
+	if encoded != "" {
+		data, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return fmt.Errorf("decode: %w", err)
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			current = line[1 : len(line)-1]
-			sections[current] = map[string]string{}
-			continue
-		}
-		if current != "" {
-			if idx := strings.Index(line, "="); idx >= 0 {
-				key := strings.TrimSpace(line[:idx])
-				val := strings.TrimSpace(line[idx+1:])
-				sections[current][key] = val
-			}
-		}
+		b.Write(data)
 	}
-	return sections, nil
+
+	return os.WriteFile(path, []byte(b.String()), 0644)
 }
 
 func isInitrd() bool {
@@ -772,6 +659,9 @@ func bootFromInitrd(rootDev, mvmWS string, extraMounts []extraMount) error {
 	for _, dir := range []string{"proc", "sys", "dev", "dev/pts", "run", "tmp"} {
 		os.MkdirAll(filepath.Join(newRoot, dir), 0755)
 	}
+
+	// Copy supervisord binary from initrd to rootfs before chroot.
+	copyFile("/usr/bin/supervisord", filepath.Join(newRoot, "usr/bin/supervisord"))
 
 	// switch_root: pivot_root doesn't work from initramfs (rootfs),
 	// so use the MS_MOVE + chroot pattern instead.
@@ -882,6 +772,16 @@ func waitForDevice(path string, timeout time.Duration) error {
 func writeFile(path, content string, mode os.FileMode) {
 	os.MkdirAll(filepath.Dir(path), 0755)
 	os.WriteFile(path, []byte(content), mode)
+}
+
+func copyFile(src, dst string) {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "copy %s: %v\n", src, err)
+		return
+	}
+	os.MkdirAll(filepath.Dir(dst), 0755)
+	os.WriteFile(dst, data, 0755)
 }
 
 func decodeEnv(encoded string) map[string]string {

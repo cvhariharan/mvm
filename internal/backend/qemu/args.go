@@ -179,22 +179,27 @@ func encodeFileMounts(mounts []backend.FileMount) string {
 	return base64.StdEncoding.EncodeToString([]byte(strings.Join(lines, "\n")))
 }
 
-// encodeServices encodes services as base64 INI text ready to be written to
-// /etc/mvm/services.ini inside the guest.
+// encodeServices encodes services as base64 supervisord-compatible INI text
+// ready to be written to /etc/mvm/supervisord.conf inside the guest.
 func encodeServices(svcs []backend.Service) string {
 	var b strings.Builder
 	for _, s := range svcs {
-		fmt.Fprintf(&b, "[service.%s]\n", s.Name)
-		fmt.Fprintf(&b, "cmd=%s\n", s.Cmd)
+		fmt.Fprintf(&b, "[program:%s]\n", s.Name)
+		fmt.Fprintf(&b, "command=%s\n", s.Cmd)
+		fmt.Fprintf(&b, "autostart=true\n")
 		if s.OneShot {
-			fmt.Fprintf(&b, "oneshot=true\n")
-		}
-		if s.Restart {
-			fmt.Fprintf(&b, "restart=always\n")
+			fmt.Fprintf(&b, "autorestart=false\n")
+			fmt.Fprintf(&b, "startsecs=0\n")
+		} else if s.Restart {
+			fmt.Fprintf(&b, "autorestart=true\n")
+		} else {
+			fmt.Fprintf(&b, "autorestart=false\n")
 		}
 		if s.After != "" {
-			fmt.Fprintf(&b, "after=%s\n", s.After)
+			fmt.Fprintf(&b, "depends_on=%s\n", s.After)
 		}
+		fmt.Fprintf(&b, "stdout_logfile=/var/log/%%(program_name)s.log\n")
+		fmt.Fprintf(&b, "stderr_logfile=/var/log/%%(program_name)s.log\n")
 		fmt.Fprintln(&b)
 	}
 	return base64.StdEncoding.EncodeToString([]byte(b.String()))
