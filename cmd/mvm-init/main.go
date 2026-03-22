@@ -587,6 +587,7 @@ func writeServicesConfig(encoded, sshdPath, path string) error {
 	b.WriteString("[unix_http_server]\nfile=/var/run/supervisord.sock\n\n")
 	b.WriteString("[supervisord]\nnodaemon=true\nlogfile=/var/log/supervisord.log\nlogfile_maxbytes=0\n\n")
 	b.WriteString("[supervisorctl]\nserverurl=unix:///var/run/supervisord.sock\n\n")
+	b.WriteString("[program-default]\nenvironment=PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\n\n")
 
 	if sshdPath != "" {
 		fmt.Fprintf(&b, "[program:sshd]\ncommand=%s -D\nautostart=true\nautorestart=true\n\n", sshdPath)
@@ -621,6 +622,7 @@ func mountEssential() {
 		{"devpts", "/dev/pts", "mode=0620,ptmxmode=0666"},
 		{"tmpfs", "/run", "mode=0755"},
 		{"tmpfs", "/tmp", ""},
+		{"cgroup2", "/sys/fs/cgroup", "nsdelegate,memory_recursiveprot"},
 	} {
 		os.MkdirAll(m.target, 0755)
 		if err := syscall.Mount(m.fstype, m.target, m.fstype, 0, m.opts); err != nil {
