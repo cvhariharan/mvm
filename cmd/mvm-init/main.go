@@ -469,6 +469,7 @@ KbdInteractiveAuthentication no
 X11Forwarding no
 PrintMotd no
 AcceptEnv LANG LC_* TERM COLORTERM
+Subsystem sftp internal-sftp
 `
 	writeFile("/etc/ssh/sshd_config", sshdConfig, 0644)
 
@@ -773,6 +774,7 @@ func waitForDevice(path string, timeout time.Duration) error {
 
 func writeFile(path, content string, mode os.FileMode) {
 	os.MkdirAll(filepath.Dir(path), 0755)
+	os.Remove(path) // remove first to handle symlinks and fix stale permissions
 	os.WriteFile(path, []byte(content), mode)
 }
 
