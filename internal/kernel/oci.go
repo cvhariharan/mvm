@@ -34,13 +34,6 @@ func NewPuller() (*Puller, error) {
 // Pull downloads a kernel from an OCI registry or local daemon and caches it locally.
 // Returns the path to the cached kernel.
 func (p *Puller) Pull(ref string) (string, error) {
-	// Check if already cached
-	if p.cache.Exists(ref, kernelFilename) {
-		return p.cache.FilePath(ref, kernelFilename), nil
-	}
-
-	fmt.Printf("Pulling kernel %s...\n", ref)
-
 	ctx := context.Background()
 
 	cli, err := client.New(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -49,20 +42,33 @@ func (p *Puller) Pull(ref string) (string, error) {
 	}
 	defer cli.Close()
 
-	// Check if image exists locally first
-	_, err = cli.ImageInspect(ctx, ref)
+	// Resolve image to its ID so the cache is keyed by content, not tag.
+	inspect, err := cli.ImageInspect(ctx, ref)
 	if err != nil {
-		// Image not found locally, try to pull
-		fmt.Printf("Image not found locally, pulling from registry...\n")
+		fmt.Printf("Pulling kernel %s...\n", ref)
 		resp, err := cli.ImagePull(ctx, ref, client.ImagePullOptions{})
 		if err != nil {
 			return "", fmt.Errorf("failed to pull kernel image: %w", err)
 		}
 		io.Copy(io.Discard, resp)
 		resp.Close()
+
+		inspect, err = cli.ImageInspect(ctx, ref)
+		if err != nil {
+			return "", fmt.Errorf("failed to inspect kernel image after pull: %w", err)
+		}
 	} else {
 		fmt.Printf("Using local image %s\n", ref)
 	}
+
+	imageID := inspect.ID
+
+	// Check cache using image ID (not the mutable tag)
+	if p.cache.Exists(imageID, kernelFilename) {
+		return p.cache.FilePath(imageID, kernelFilename), nil
+	}
+
+	fmt.Printf("Extracting kernel from %s...\n", ref)
 
 	// Create container to export filesystem (entrypoint never runs; required by Podman for scratch images)
 	createResp, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{
@@ -81,17 +87,17 @@ func (p *Puller) Pull(ref string) (string, error) {
 	defer exportResp.Close()
 
 	// Extract bzImage from tar
-	if err := p.cache.EnsureDir(ref); err != nil {
+	if err := p.cache.EnsureDir(imageID); err != nil {
 		return "", err
 	}
 
-	kernelPath, err := extractFileFromTar(exportResp, kernelFilename, p.cache.FilePath(ref, kernelFilename))
+	kernelPath, err := extractFileFromTar(exportResp, kernelFilename, p.cache.FilePath(imageID, kernelFilename))
 	if err != nil {
 		return "", fmt.Errorf("bzImage not found in kernel image %s: %w", ref, err)
 	}
 
 	// Store the reference for listing
-	if err := p.cache.StoreMetadata(ref, "ref", ref); err != nil {
+	if err := p.cache.StoreMetadata(imageID, "ref", ref); err != nil {
 		return "", err
 	}
 
@@ -101,9 +107,6 @@ func (p *Puller) Pull(ref string) (string, error) {
 
 // Get returns the path to a cached kernel, pulling it if necessary.
 func (p *Puller) Get(ref string) (string, error) {
-	if p.cache.Exists(ref, kernelFilename) {
-		return p.cache.FilePath(ref, kernelFilename), nil
-	}
 	return p.Pull(ref)
 }
 

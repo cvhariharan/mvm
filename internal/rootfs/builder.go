@@ -45,10 +45,41 @@ func NewBuilder() (*Builder, error) {
 
 // Get returns the path to a cached rootfs, building it if necessary.
 func (b *Builder) Get(ctx context.Context, imageName string) (string, error) {
-	if b.cache.Exists(imageName, rootfsFilename) {
-		return b.cache.FilePath(imageName, rootfsFilename), nil
+	// Resolve image to its ID so the cache is keyed by content, not tag.
+	imageID, err := b.resolveImageID(ctx, imageName)
+	if err != nil {
+		return "", err
 	}
-	return b.build(ctx, imageName)
+
+	if b.cache.Exists(imageID, rootfsFilename) {
+		return b.cache.FilePath(imageID, rootfsFilename), nil
+	}
+	return b.build(ctx, imageName, imageID)
+}
+
+// resolveImageID ensures the image exists locally (pulling if needed) and
+// returns its content-addressable ID.
+func (b *Builder) resolveImageID(ctx context.Context, imageName string) (string, error) {
+	inspect, err := b.client.ImageInspect(ctx, imageName)
+	if err == nil {
+		return inspect.ID, nil
+	}
+
+	bar := newSpinner("Pulling " + imageName)
+	resp, err := b.client.ImagePull(ctx, imageName, client.ImagePullOptions{})
+	if err != nil {
+		bar.Finish()
+		return "", fmt.Errorf("failed to pull image: %w", err)
+	}
+	io.Copy(io.Discard, resp)
+	resp.Close()
+	bar.Finish()
+
+	inspect, err = b.client.ImageInspect(ctx, imageName)
+	if err != nil {
+		return "", fmt.Errorf("failed to inspect image after pull: %w", err)
+	}
+	return inspect.ID, nil
 }
 
 // Close releases the Docker client.
@@ -58,7 +89,7 @@ func (b *Builder) Close() {
 	}
 }
 
-func (b *Builder) build(ctx context.Context, imageName string) (string, error) {
+func (b *Builder) build(ctx context.Context, imageName, imageID string) (string, error) {
 	workDir, err := os.MkdirTemp("", "mvm-rootfs-")
 	if err != nil {
 		return "", err
@@ -68,10 +99,7 @@ func (b *Builder) build(ctx context.Context, imageName string) (string, error) {
 	rootfsTar := filepath.Join(workDir, "rootfs.tar")
 	rootfsImg := filepath.Join(workDir, rootfsFilename)
 
-	if err := b.pullImage(ctx, imageName); err != nil {
-		return "", err
-	}
-
+	// Image is already local (resolveImageID ensures this).
 	containerID, err := b.createContainer(ctx, imageName)
 	if err != nil {
 		return "", err
@@ -89,36 +117,17 @@ func (b *Builder) build(ctx context.Context, imageName string) (string, error) {
 	}
 	bar.Finish()
 
-	// Move result into cache
-	if err := b.cache.EnsureDir(imageName); err != nil {
+	// Move result into cache, keyed by image ID
+	if err := b.cache.EnsureDir(imageID); err != nil {
 		return "", err
 	}
-	destPath := b.cache.FilePath(imageName, rootfsFilename)
+	destPath := b.cache.FilePath(imageID, rootfsFilename)
 	if err := copyFile(rootfsImg, destPath); err != nil {
 		return "", fmt.Errorf("cache rootfs: %w", err)
 	}
-	b.cache.StoreMetadata(imageName, "ref", imageName)
+	b.cache.StoreMetadata(imageID, "ref", imageName)
 
 	return destPath, nil
-}
-
-func (b *Builder) pullImage(ctx context.Context, imageName string) error {
-	// Use local image if available, otherwise pull from registry.
-	_, err := b.client.ImageInspect(ctx, imageName)
-	if err == nil {
-		return nil
-	}
-
-	bar := newSpinner("Pulling " + imageName)
-	defer bar.Finish()
-
-	resp, err := b.client.ImagePull(ctx, imageName, client.ImagePullOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to pull image: %w", err)
-	}
-	defer resp.Close()
-	io.Copy(io.Discard, resp)
-	return nil
 }
 
 func (b *Builder) createContainer(ctx context.Context, imageName string) (string, error) {
