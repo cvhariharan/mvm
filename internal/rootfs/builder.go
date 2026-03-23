@@ -3,12 +3,14 @@ package rootfs
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 
+	"github.com/Microsoft/hcsshim/ext4/tar2ext4"
 	"github.com/cvhariharan/mvm/internal/cache"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
@@ -180,26 +182,86 @@ func (b *Builder) removeContainer(ctx context.Context, containerID string) {
 }
 
 func (b *Builder) createExt4Image(tarPath, imagePath string) error {
-	size := tarSize(tarPath)
-	// Double for ext4 metadata, journal, and inodes; minimum 2GB.
-	size = size * 2
-	minSize := int64(2) << 30
-	if size < minSize {
+	tarFile, err := os.Open(tarPath)
+	if err != nil {
+		return fmt.Errorf("open tar: %w", err)
+	}
+	defer tarFile.Close()
+
+	imgFile, err := os.Create(imagePath)
+	if err != nil {
+		return fmt.Errorf("create image: %w", err)
+	}
+	defer imgFile.Close()
+
+	// Double tar size for filesystem overhead; minimum 2GB.
+	size := tarSize(tarPath) * 2
+	if minSize := int64(2) << 30; size < minSize {
 		size = minSize
 	}
-	// mke2fs expects size in KiB when using the K suffix.
-	sizeStr := fmt.Sprintf("%dK", size/1024)
 
-	cmd := exec.Command("mke2fs", "-F", "-t", "ext4", "-d", tarPath, "-L", "rootfs", imagePath, sizeStr)
+	if err := tar2ext4.ConvertTarToExt4(tarFile, imgFile,
+		tar2ext4.MaximumDiskSize(size),
+		tar2ext4.ConvertWhiteout,
+		tar2ext4.InlineData,
+	); err != nil {
+		return err
+	}
+
+	if err := clearReadOnly(imgFile); err != nil {
+		return err
+	}
+
+	// Expand the image to the target size — compactext4 creates a
+	// minimally-sized image, so we truncate to grow and resize2fs
+	// to make the filesystem span the full image.
+	if err := imgFile.Truncate(size); err != nil {
+		return fmt.Errorf("truncate image: %w", err)
+	}
+	imgFile.Close()
+
+	cmd := exec.Command("resize2fs", imagePath)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%w: %s", err, stderr.String())
+		return fmt.Errorf("resize2fs: %w: %s", err, stderr.String())
 	}
 	return nil
 }
 
-// tarSize returns the size of the tar file on disk.
+// clearReadOnly clears the RO_COMPAT_READONLY feature flag in the ext4
+// superblock so the filesystem can be mounted read-write.
+// The superblock starts at byte 1024; s_feature_ro_compat is at offset 100
+// within the superblock (byte 1124 of the image).
+func clearReadOnly(f *os.File) error {
+	const (
+		sbOffset        = 1024
+		roCompatOffset  = sbOffset + 100 // offset of s_feature_ro_compat
+		roCompatReadonly = uint32(0x1000)
+	)
+
+	if _, err := f.Seek(roCompatOffset, io.SeekStart); err != nil {
+		return fmt.Errorf("seek to ro_compat: %w", err)
+	}
+
+	var flags uint32
+	if err := binary.Read(f, binary.LittleEndian, &flags); err != nil {
+		return fmt.Errorf("read ro_compat: %w", err)
+	}
+
+	flags &^= roCompatReadonly
+
+	if _, err := f.Seek(roCompatOffset, io.SeekStart); err != nil {
+		return fmt.Errorf("seek to ro_compat: %w", err)
+	}
+
+	if err := binary.Write(f, binary.LittleEndian, flags); err != nil {
+		return fmt.Errorf("write ro_compat: %w", err)
+	}
+
+	return nil
+}
+
 func tarSize(tarPath string) int64 {
 	if info, err := os.Stat(tarPath); err == nil {
 		return info.Size()
