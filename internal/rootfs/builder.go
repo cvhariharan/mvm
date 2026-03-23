@@ -73,9 +73,11 @@ func (b *Builder) resolveImageID(ctx context.Context, imageName string) (string,
 		bar.Finish()
 		return "", fmt.Errorf("failed to pull image: %w", err)
 	}
-	io.Copy(io.Discard, resp)
-	resp.Close()
+	pullErr := resp.Wait(ctx)
 	bar.Finish()
+	if pullErr != nil {
+		return "", fmt.Errorf("failed to pull image: %w", pullErr)
+	}
 
 	inspect, err = b.client.ImageInspect(ctx, imageName)
 	if err != nil {
@@ -146,13 +148,6 @@ func (b *Builder) createContainer(ctx context.Context, imageName string) (string
 }
 
 func (b *Builder) exportContainer(ctx context.Context, containerID, destPath string) error {
-	// Get container size for progress bar.
-	info, err := b.client.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{Size: true})
-	var total int64
-	if err == nil && info.Container.SizeRootFs != nil {
-		total = *info.Container.SizeRootFs
-	}
-
 	resp, err := b.client.ContainerExport(ctx, containerID, client.ContainerExportOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to export container: %w", err)
@@ -165,15 +160,9 @@ func (b *Builder) exportContainer(ctx context.Context, containerID, destPath str
 	}
 	defer f.Close()
 
-	if total > 0 {
-		bar := newByteBar(total, "Exporting container")
-		_, err = io.Copy(io.MultiWriter(f, bar), resp)
-		bar.Finish()
-	} else {
-		bar := newSpinner("Exporting container")
-		_, err = io.Copy(f, resp)
-		bar.Finish()
-	}
+	bar := newSpinner("Exporting container")
+	_, err = io.Copy(f, resp)
+	bar.Finish()
 	return err
 }
 

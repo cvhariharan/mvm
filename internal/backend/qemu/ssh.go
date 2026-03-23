@@ -38,6 +38,8 @@ func AttachSSH(port int, keyPath, username, command string) (int, error) {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
 	// Retry connection until SSH server is ready.
+	// We retry on any error except a clean auth failure — sshd may accept the
+	// TCP connection and reset it while still generating host keys.
 	var client *ssh.Client
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
@@ -45,7 +47,11 @@ func AttachSSH(port int, keyPath, username, command string) (int, error) {
 		if err == nil {
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
+		var authErr *ssh.PassphraseMissingError
+		if errors.As(err, &authErr) {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 	if client == nil {
 		return 1, fmt.Errorf("ssh connect to %s: %w", addr, err)
