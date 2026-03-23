@@ -130,7 +130,7 @@ func (m *Manager) Create(ctx context.Context, opts CreateOpts) (*state.VMState, 
 		CPUs:    m.cfg.VM.CPUs,
 		Command: opts.Command,
 		UID:     uid,
-		Shell:   filepath.Base(os.Getenv("SHELL")),
+		Shell:   m.cfg.VM.Shell,
 		Network: state.NetworkState{
 			Mode:  m.cfg.Network.Mode,
 			DNS:   m.cfg.Network.DNS,
@@ -258,40 +258,15 @@ func (m *Manager) Stop(ctx context.Context, id string) error {
 	// Send shutdown message (or SIGTERM if no ctrl channel).
 	m.backend.Stop(ctx, vm)
 
-	// Mark stopped immediately so the CLI exits without delay.
+	// Wait for the QEMU process to exit, escalating as needed.
+	escalateAndWait(pid, 5*time.Second)
+
 	vmState.Status = state.StatusStopped
 	vmState.StoppedAt = time.Now()
 	vmState.Pid = 0
 	if err := m.store.Save(vmState); err != nil {
 		return fmt.Errorf("save state: %w", err)
 	}
-
-	// Escalate in the background: wait for graceful exit, then SIGTERM, then SIGKILL.
-	go func() {
-		proc, err := os.FindProcess(pid)
-		if err != nil {
-			return
-		}
-		// Give the guest time to sync + power off.
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			if err := proc.Signal(syscall.Signal(0)); err != nil {
-				return // already exited
-			}
-			time.Sleep(200 * time.Millisecond)
-		}
-		// Still alive — SIGTERM.
-		proc.Signal(syscall.SIGTERM)
-		deadline = time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			if err := proc.Signal(syscall.Signal(0)); err != nil {
-				return
-			}
-			time.Sleep(200 * time.Millisecond)
-		}
-		// Still alive — SIGKILL.
-		proc.Signal(syscall.SIGKILL)
-	}()
 
 	return nil
 }
@@ -490,7 +465,7 @@ func (m *Manager) Rebuild(ctx context.Context, id string) (*state.VMState, error
 	vmState.InitrdPath = initrdPath
 	vmState.Memory = m.cfg.VM.Memory
 	vmState.CPUs = m.cfg.VM.CPUs
-	vmState.Shell = filepath.Base(os.Getenv("SHELL"))
+	vmState.Shell = m.cfg.VM.Shell
 	vmState.Network = state.NetworkState{
 		Mode:  m.cfg.Network.Mode,
 		DNS:   m.cfg.Network.DNS,
@@ -577,6 +552,37 @@ func (m *Manager) Build(ctx context.Context) error {
 
 	fmt.Println("Build complete")
 	return nil
+}
+
+// escalateAndWait waits for a graceful exit, then sends SIGTERM, then SIGKILL.
+// Blocks until the process is confirmed dead or forcefully killed.
+func escalateAndWait(pid int, grace time.Duration) {
+	if pid <= 0 {
+		return
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return
+	}
+	// Give the guest time to shut down gracefully.
+	deadline := time.Now().Add(grace)
+	for time.Now().Before(deadline) {
+		if err := proc.Signal(syscall.Signal(0)); err != nil {
+			return // already exited
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	// Still alive — SIGTERM.
+	proc.Signal(syscall.SIGTERM)
+	deadline = time.Now().Add(grace)
+	for time.Now().Before(deadline) {
+		if err := proc.Signal(syscall.Signal(0)); err != nil {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	// Still alive — SIGKILL.
+	proc.Signal(syscall.SIGKILL)
 }
 
 // waitForExit polls until the process has exited or the timeout expires.

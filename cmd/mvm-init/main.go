@@ -370,7 +370,7 @@ func run() error {
 	// Write env vars and workspace cd to /etc/profile.d/ so login shells
 	// source them automatically — works with any shell, no `su` needed.
 	writeEnvProfile(mvmEnv)
-	writeWorkspaceProfile(mvmWS)
+	writeWorkspaceProfile(mvmWS, mvmShell)
 
 	// Configure sshd (keys, config) before writing supervisord config so
 	// we can include it as a managed service.
@@ -778,6 +778,16 @@ func writeFile(path, content string, mode os.FileMode) {
 	os.WriteFile(path, []byte(content), mode)
 }
 
+func appendFile(path, content string) {
+	os.MkdirAll(filepath.Dir(path), 0755)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	f.WriteString(content)
+}
+
 func copyFile(src, dst string) {
 	data, err := os.ReadFile(src)
 	if err != nil {
@@ -937,15 +947,18 @@ func writeEnvProfile(env map[string]string) {
 	writeFile("/etc/profile.d/mvm-env.sh", b.String(), 0644)
 }
 
-// writeWorkspaceProfile writes a cd to the workspace directory in
-// /etc/profile.d/zz-mvm-ws.sh. The zz- prefix ensures it runs after
-// other profile.d scripts.
-func writeWorkspaceProfile(ws string) {
+// writeWorkspaceProfile writes a cd to the workspace directory so that
+// login shells start in the right place. It writes to /etc/profile.d/
+// for bash/sh and to /etc/zprofile for zsh to cover all distros.
+func writeWorkspaceProfile(ws, shell string) {
 	if ws == "" {
 		return
 	}
 	content := fmt.Sprintf("cd %s 2>/dev/null\n", shellescape(ws))
 	writeFile("/etc/profile.d/zz-mvm-ws.sh", content, 0644)
+	if shell == "zsh" {
+		appendFile("/etc/zprofile", content)
+	}
 }
 
 // shellescape wraps a value in single quotes, escaping embedded single

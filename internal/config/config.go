@@ -16,6 +16,7 @@ const (
 	DefaultMemory  = "512M"
 	DefaultCPUs    = 2
 	DefaultBackend = "qemu"
+	DefaultShell   = "bash"
 	DefaultDNS     = "10.0.2.3"
 	DefaultNetMode = "slirp"
 	ConfigFile     = ".mvm"
@@ -51,6 +52,7 @@ type VMConfig struct {
 	Memory  string `koanf:"memory"`
 	CPUs    int    `koanf:"cpus"`
 	Backend string `koanf:"backend"`
+	Shell   string `koanf:"shell"`
 }
 
 type NetworkConfig struct {
@@ -86,6 +88,7 @@ var defaults = map[string]interface{}{
 	"vm.memory":    DefaultMemory,
 	"vm.cpus":      DefaultCPUs,
 	"vm.backend":   DefaultBackend,
+	"vm.shell":     DefaultShell,
 	"network.mode": DefaultNetMode,
 	"network.dns":  DefaultDNS,
 }
@@ -134,6 +137,7 @@ image = "alpine:latest"
 kernel = "ghcr.io/mvm/kernel:latest"
 memory = "512M"
 cpus = 2
+shell = "bash"
 
 [network]
 mode = "slirp"
