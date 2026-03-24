@@ -25,6 +25,7 @@ type VMConfig struct {
 	SSHPubKey   string
 	SSHPort     int
 	Services    []Service
+	DiskSize    string
 }
 
 type Service struct {
@@ -76,11 +77,13 @@ type WorkspaceConfig struct {
 
 // VM represents a created VM instance.
 type VM struct {
-	ID         string
-	OverlayImg string
-	CtrlSocket string
-	SSHPort    int
-	Pid        int
+	ID          string
+	OverlayImg  string // legacy qcow2 (old VMs)
+	DataDiskImg string // raw data disk for overlayfs
+	QMPSocket   string // QMP socket for block_resize
+	CtrlSocket  string
+	SSHPort     int
+	Pid         int
 }
 
 // Backend is the interface for VM lifecycle management.

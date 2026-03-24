@@ -3,7 +3,6 @@ package rootfs
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -185,10 +184,11 @@ func (b *Builder) createExt4Image(tarPath, imagePath string) error {
 	}
 	defer imgFile.Close()
 
-	// Double tar size for filesystem overhead; minimum 2GB.
-	size := tarSize(tarPath) * 2
-	if minSize := int64(2) << 30; size < minSize {
-		size = minSize
+	// Add 20% for ext4 metadata overhead. The rootfs is mounted
+	// read-only (overlayfs lowerdir), so no extra space is needed.
+	size := tarSize(tarPath) * 120 / 100
+	if minSize := int64(256) << 20; size < minSize {
+		size = minSize // 256MB minimum
 	}
 
 	if err := tar2ext4.ConvertTarToExt4(tarFile, imgFile,
@@ -196,10 +196,6 @@ func (b *Builder) createExt4Image(tarPath, imagePath string) error {
 		tar2ext4.ConvertWhiteout,
 		tar2ext4.InlineData,
 	); err != nil {
-		return err
-	}
-
-	if err := clearReadOnly(imgFile); err != nil {
 		return err
 	}
 
@@ -220,38 +216,6 @@ func (b *Builder) createExt4Image(tarPath, imagePath string) error {
 	return nil
 }
 
-// clearReadOnly clears the RO_COMPAT_READONLY feature flag in the ext4
-// superblock so the filesystem can be mounted read-write.
-// The superblock starts at byte 1024; s_feature_ro_compat is at offset 100
-// within the superblock (byte 1124 of the image).
-func clearReadOnly(f *os.File) error {
-	const (
-		sbOffset        = 1024
-		roCompatOffset  = sbOffset + 100 // offset of s_feature_ro_compat
-		roCompatReadonly = uint32(0x1000)
-	)
-
-	if _, err := f.Seek(roCompatOffset, io.SeekStart); err != nil {
-		return fmt.Errorf("seek to ro_compat: %w", err)
-	}
-
-	var flags uint32
-	if err := binary.Read(f, binary.LittleEndian, &flags); err != nil {
-		return fmt.Errorf("read ro_compat: %w", err)
-	}
-
-	flags &^= roCompatReadonly
-
-	if _, err := f.Seek(roCompatOffset, io.SeekStart); err != nil {
-		return fmt.Errorf("seek to ro_compat: %w", err)
-	}
-
-	if err := binary.Write(f, binary.LittleEndian, flags); err != nil {
-		return fmt.Errorf("write ro_compat: %w", err)
-	}
-
-	return nil
-}
 
 func tarSize(tarPath string) int64 {
 	if info, err := os.Stat(tarPath); err == nil {

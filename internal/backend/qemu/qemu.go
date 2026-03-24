@@ -54,33 +54,72 @@ func (q *QEMU) Create(ctx context.Context, cfg *backend.VMConfig) (*backend.VM, 
 		return nil, fmt.Errorf("create overlay dir: %w", err)
 	}
 
-	overlayImg := filepath.Join(overlayDir, cfg.ID+".qcow2")
+	dataDiskImg := filepath.Join(overlayDir, cfg.ID+".data.img")
 	ctrlSocket := filepath.Join(overlayDir, cfg.ID+".sock")
+	qmpSocket := filepath.Join(overlayDir, cfg.ID+".qmp")
 
-	// Create qcow2 overlay backed by the rootfs
-	cmd := exec.CommandContext(ctx, "qemu-img", "create",
-		"-f", "qcow2",
-		"-b", cfg.Rootfs,
-		"-F", "raw",
-		overlayImg,
-	)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("qemu-img create: %s: %w", out, err)
+	// Create sparse raw data disk and format as ext4.
+	sizeBytes, err := parseDiskSize(cfg.DiskSize)
+	if err != nil {
+		return nil, fmt.Errorf("parse disk size %q: %w", cfg.DiskSize, err)
+	}
+
+	f, err := os.Create(dataDiskImg)
+	if err != nil {
+		return nil, fmt.Errorf("create data disk: %w", err)
+	}
+	if err := f.Truncate(sizeBytes); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("truncate data disk: %w", err)
+	}
+	f.Close()
+
+	mkfs := exec.CommandContext(ctx, "mkfs.ext4", "-q", "-F", dataDiskImg)
+	if out, err := mkfs.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("mkfs.ext4: %s: %w", out, err)
 	}
 
 	return &backend.VM{
-		ID:         cfg.ID,
-		OverlayImg: overlayImg,
-		CtrlSocket: ctrlSocket,
-		SSHPort:    cfg.SSHPort,
+		ID:          cfg.ID,
+		DataDiskImg: dataDiskImg,
+		QMPSocket:   qmpSocket,
+		CtrlSocket:  ctrlSocket,
+		SSHPort:     cfg.SSHPort,
 	}, nil
+}
+
+// parseDiskSize converts a size string like "4G", "512M" to bytes.
+func parseDiskSize(s string) (int64, error) {
+	if s == "" {
+		return 4 << 30, nil // default 4G
+	}
+	var multiplier int64 = 1
+	switch s[len(s)-1] {
+	case 'G', 'g':
+		multiplier = 1 << 30
+		s = s[:len(s)-1]
+	case 'M', 'm':
+		multiplier = 1 << 20
+		s = s[:len(s)-1]
+	case 'K', 'k':
+		multiplier = 1 << 10
+		s = s[:len(s)-1]
+	}
+	n, err := fmt.Sscanf(s, "%d", new(int64))
+	if n != 1 || err != nil {
+		return 0, fmt.Errorf("invalid size: %s", s)
+	}
+	var val int64
+	fmt.Sscanf(s, "%d", &val)
+	return val * multiplier, nil
 }
 
 // Start launches the QEMU process and returns immediately.
 // Sets vm.Pid. Call Attach() to bridge the console, or Wait() to get the exit code.
 func (q *QEMU) Start(ctx context.Context, vm *backend.VM, cfg *backend.VMConfig) error {
-	// Remove stale socket from a previous run
+	// Remove stale sockets from a previous run
 	os.Remove(vm.CtrlSocket)
+	os.Remove(vm.QMPSocket)
 
 	args, err := buildArgs(cfg, vm)
 	if err != nil {
@@ -213,7 +252,9 @@ func (q *QEMU) Stop(_ context.Context, vm *backend.VM) error {
 }
 
 func (q *QEMU) Destroy(_ context.Context, vm *backend.VM) error {
-	os.Remove(vm.OverlayImg)
+	os.Remove(vm.OverlayImg)   // legacy qcow2
+	os.Remove(vm.DataDiskImg)  // new data disk
 	os.Remove(vm.CtrlSocket)
+	os.Remove(vm.QMPSocket)
 	return nil
 }

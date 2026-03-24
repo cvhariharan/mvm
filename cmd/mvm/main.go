@@ -172,7 +172,7 @@ var snapshotDeleteCmd = &cobra.Command{
 
 var resizeCmd = &cobra.Command{
 	Use:   "resize <id-or-name> <size>",
-	Short: "Resize a microVM's disk (VM must be stopped, e.g. 10G or +5G)",
+	Short: "Resize a microVM's disk (e.g. 10G or +5G). Run resize2fs /dev/vdb in guest if running.",
 	Args:  cobra.ExactArgs(2),
 	RunE:  runResize,
 }
@@ -956,10 +956,14 @@ func runResize(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := mgr.Resize(context.Background(), args[0], args[1]); err != nil {
+	wasRunning, err := mgr.Resize(context.Background(), args[0], args[1])
+	if err != nil {
 		return err
 	}
 	fmt.Printf("Resized %s to %s\n", args[0], args[1])
+	if wasRunning {
+		fmt.Println("Run `sudo resize2fs /dev/vdb` inside the VM to expand the filesystem.")
+	}
 	return nil
 }
 

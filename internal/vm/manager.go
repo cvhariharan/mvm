@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -118,17 +119,19 @@ func (m *Manager) Create(ctx context.Context, opts CreateOpts) (*state.VMState, 
 		CreatedAt: time.Now(),
 		Image:     m.cfg.VM.Image,
 
-		KernelPath:  kernelPath,
-		InitrdPath:  initrdPath,
-		RootfsPath:  rootfsPath,
-		OverlayPath: vmDir + "/" + id + ".qcow2",
-		SocketPath:  vmDir + "/" + id + ".sock",
-		SSHPort:     sshPort,
-		SSHKeyPath:  sshKeyPath,
+		KernelPath:    kernelPath,
+		InitrdPath:    initrdPath,
+		RootfsPath:    rootfsPath,
+		DataDiskPath:  vmDir + "/" + id + ".data.img",
+		QMPSocketPath: vmDir + "/" + id + ".qmp",
+		SocketPath:    vmDir + "/" + id + ".sock",
+		SSHPort:       sshPort,
+		SSHKeyPath:    sshKeyPath,
 
-		Memory:  m.cfg.VM.Memory,
-		CPUs:    m.cfg.VM.CPUs,
-		Command: opts.Command,
+		DiskSize: m.cfg.VM.Disk,
+		Memory:   m.cfg.VM.Memory,
+		CPUs:     m.cfg.VM.CPUs,
+		Command:  opts.Command,
 		UID:     uid,
 		Shell:   m.cfg.VM.Shell,
 		Network: state.NetworkState{
@@ -306,20 +309,42 @@ func (m *Manager) List() ([]*state.VMState, error) {
 	return m.store.List()
 }
 
-// Snapshot creates an internal snapshot of the VM's qcow2 overlay.
+// Snapshot creates a file-level snapshot of the VM's data disk.
+// The VM must be stopped for a consistent snapshot.
 func (m *Manager) Snapshot(ctx context.Context, id, name string) error {
 	vmState, err := m.store.Lookup(id)
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, "qemu-img", "snapshot", "-c", name, vmState.OverlayPath)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("snapshot: %s: %w", out, err)
+	if vmState.Status == state.StatusRunning {
+		return fmt.Errorf("vm %s is running; stop it before creating a snapshot", vmState.ID)
 	}
-	return nil
+
+	diskPath := vmState.DataDiskPath
+	if diskPath == "" {
+		// Legacy: use qemu-img snapshot on qcow2
+		cmd := exec.CommandContext(ctx, "qemu-img", "snapshot", "-c", name, vmState.OverlayPath)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("snapshot: %s: %w", out, err)
+		}
+		return nil
+	}
+
+	snapPath := diskPath + ".snap-" + name
+	cmd := exec.CommandContext(ctx, "cp", "--reflink=auto", diskPath, snapPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("snapshot copy: %s: %w", out, err)
+	}
+
+	vmState.Snapshots = append(vmState.Snapshots, state.SnapshotState{
+		Name:      name,
+		CreatedAt: time.Now(),
+		Path:      snapPath,
+	})
+	return m.store.Save(vmState)
 }
 
-// RestoreSnapshot reverts the VM's qcow2 overlay to a named snapshot.
+// RestoreSnapshot reverts the VM's data disk to a named snapshot.
 // The VM must be stopped.
 func (m *Manager) RestoreSnapshot(ctx context.Context, id, name string) error {
 	vmState, err := m.store.Lookup(id)
@@ -329,28 +354,60 @@ func (m *Manager) RestoreSnapshot(ctx context.Context, id, name string) error {
 	if vmState.Status == state.StatusRunning {
 		return fmt.Errorf("vm %s is running; stop it before restoring a snapshot", vmState.ID)
 	}
-	cmd := exec.CommandContext(ctx, "qemu-img", "snapshot", "-a", name, vmState.OverlayPath)
+
+	diskPath := vmState.DataDiskPath
+	if diskPath == "" {
+		// Legacy
+		cmd := exec.CommandContext(ctx, "qemu-img", "snapshot", "-a", name, vmState.OverlayPath)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("restore snapshot: %s: %w", out, err)
+		}
+		return nil
+	}
+
+	snapPath := diskPath + ".snap-" + name
+	if _, err := os.Stat(snapPath); err != nil {
+		return fmt.Errorf("snapshot %q not found", name)
+	}
+
+	// Replace data disk with snapshot copy
+	cmd := exec.CommandContext(ctx, "cp", "--reflink=auto", snapPath, diskPath)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("restore snapshot: %s: %w", out, err)
+		return fmt.Errorf("restore copy: %s: %w", out, err)
 	}
 	return nil
 }
 
-// ListSnapshots lists the internal snapshots of the VM's qcow2 overlay.
+// ListSnapshots lists the snapshots of the VM.
 func (m *Manager) ListSnapshots(ctx context.Context, id string) (string, error) {
 	vmState, err := m.store.Lookup(id)
 	if err != nil {
 		return "", err
 	}
-	cmd := exec.CommandContext(ctx, "qemu-img", "snapshot", "-l", vmState.OverlayPath)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("list snapshots: %s: %w", out, err)
+
+	if vmState.DataDiskPath == "" {
+		// Legacy
+		cmd := exec.CommandContext(ctx, "qemu-img", "snapshot", "-l", vmState.OverlayPath)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("list snapshots: %s: %w", out, err)
+		}
+		return string(out), nil
 	}
-	return string(out), nil
+
+	if len(vmState.Snapshots) == 0 {
+		return "No snapshots\n", nil
+	}
+
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "%-20s %s\n", "NAME", "CREATED")
+	for _, s := range vmState.Snapshots {
+		fmt.Fprintf(&b, "%-20s %s\n", s.Name, s.CreatedAt.Format(time.RFC3339))
+	}
+	return b.String(), nil
 }
 
-// DeleteSnapshot deletes a named internal snapshot from the VM's qcow2 overlay.
+// DeleteSnapshot deletes a named snapshot from the VM.
 // The VM must be stopped.
 func (m *Manager) DeleteSnapshot(ctx context.Context, id, name string) error {
 	vmState, err := m.store.Lookup(id)
@@ -360,29 +417,125 @@ func (m *Manager) DeleteSnapshot(ctx context.Context, id, name string) error {
 	if vmState.Status == state.StatusRunning {
 		return fmt.Errorf("vm %s is running; stop it before deleting a snapshot", vmState.ID)
 	}
-	cmd := exec.CommandContext(ctx, "qemu-img", "snapshot", "-d", name, vmState.OverlayPath)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("delete snapshot: %s: %w", out, err)
+
+	if vmState.DataDiskPath == "" {
+		// Legacy
+		cmd := exec.CommandContext(ctx, "qemu-img", "snapshot", "-d", name, vmState.OverlayPath)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("delete snapshot: %s: %w", out, err)
+		}
+		return nil
 	}
-	return nil
+
+	snapPath := vmState.DataDiskPath + ".snap-" + name
+	if err := os.Remove(snapPath); err != nil {
+		return fmt.Errorf("delete snapshot file: %w", err)
+	}
+
+	// Remove from state
+	filtered := vmState.Snapshots[:0]
+	for _, s := range vmState.Snapshots {
+		if s.Name != name {
+			filtered = append(filtered, s)
+		}
+	}
+	vmState.Snapshots = filtered
+	return m.store.Save(vmState)
 }
 
-// Resize changes the size of the VM's qcow2 overlay disk.
-// The VM must be stopped. Size is a qemu-img size string e.g. "10G", "+5G".
-func (m *Manager) Resize(ctx context.Context, id, size string) error {
+// Resize changes the size of the VM's data disk. Supports live resize when the
+// Resize changes the size of the VM's data disk.
+// Size is a string like "10G", "+5G".
+// Returns true if the VM was running (caller should hint about resize2fs).
+func (m *Manager) Resize(ctx context.Context, id, size string) (bool, error) {
 	vmState, err := m.store.Lookup(id)
 	if err != nil {
-		return err
+		return false, err
 	}
-	if vmState.Status == state.StatusRunning {
-		return fmt.Errorf("vm %s is running; stop it before resizing", vmState.ID)
+
+	running := vmState.Status == state.StatusRunning
+
+	diskPath := vmState.DataDiskPath
+	if diskPath == "" {
+		// Legacy VM — fall back to qemu-img resize (must be stopped)
+		if running {
+			return false, fmt.Errorf("vm %s is running; stop it before resizing (legacy VM)", vmState.ID)
+		}
+		cmd := exec.CommandContext(ctx, "qemu-img", "resize", vmState.OverlayPath, size)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return false, fmt.Errorf("resize: %s: %w", out, err)
+		}
+		return false, nil
 	}
-	cmd := exec.CommandContext(ctx, "qemu-img", "resize", vmState.OverlayPath, size)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("resize: %s: %w", out, err)
+
+	newSizeBytes, err := resolveSize(diskPath, size)
+	if err != nil {
+		return false, fmt.Errorf("resolve size: %w", err)
 	}
-	return nil
+
+	if err := os.Truncate(diskPath, newSizeBytes); err != nil {
+		return false, fmt.Errorf("truncate data disk: %w", err)
+	}
+
+	if running {
+		// Notify QEMU of the new size so the guest kernel sees it.
+		if err := qemu.QMPBlockResize(vmState.QMPSocketPath, "data", newSizeBytes); err != nil {
+			return false, fmt.Errorf("qmp block_resize: %w", err)
+		}
+	}
+
+	if !running {
+		// Offline: also expand the filesystem on the host
+		cmd := exec.CommandContext(ctx, "resize2fs", diskPath)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			return false, fmt.Errorf("resize2fs: %w: %s", err, stderr.String())
+		}
+	}
+	return running, nil
 }
+
+// resolveSize converts a size spec (absolute "10G" or relative "+5G") to bytes.
+func resolveSize(diskPath, size string) (int64, error) {
+	relative := false
+	s := size
+	if s[0] == '+' {
+		relative = true
+		s = s[1:]
+	}
+
+	var multiplier int64 = 1
+	if len(s) > 0 {
+		switch s[len(s)-1] {
+		case 'G', 'g':
+			multiplier = 1 << 30
+			s = s[:len(s)-1]
+		case 'M', 'm':
+			multiplier = 1 << 20
+			s = s[:len(s)-1]
+		case 'K', 'k':
+			multiplier = 1 << 10
+			s = s[:len(s)-1]
+		}
+	}
+
+	val, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size %q: %w", size, err)
+	}
+	newSize := val * multiplier
+
+	if relative {
+		info, err := os.Stat(diskPath)
+		if err != nil {
+			return 0, fmt.Errorf("stat disk: %w", err)
+		}
+		newSize += info.Size()
+	}
+	return newSize, nil
+}
+
 
 // Run is the ephemeral shortcut: create, start, attach console, wait for
 // the command to finish, stop the VM, and clean up.
@@ -472,6 +625,7 @@ func (m *Manager) Rebuild(ctx context.Context, id string) (*state.VMState, error
 	vmState.Status = state.StatusStopped
 	vmState.KernelPath = kernelPath
 	vmState.InitrdPath = initrdPath
+	vmState.DiskSize = m.cfg.VM.Disk
 	vmState.Memory = m.cfg.VM.Memory
 	vmState.CPUs = m.cfg.VM.CPUs
 	vmState.Shell = m.cfg.VM.Shell
@@ -664,12 +818,18 @@ func stateToVMConfig(s *state.VMState) *backend.VMConfig {
 			GuestDir: m.GuestDir,
 		})
 	}
+	overlayDir := ""
+	if s.DataDiskPath != "" {
+		overlayDir = s.DataDiskPath[:len(s.DataDiskPath)-len("/"+s.ID+".data.img")]
+	} else if s.OverlayPath != "" {
+		overlayDir = s.OverlayPath[:len(s.OverlayPath)-len("/"+s.ID+".qcow2")]
+	}
 	return &backend.VMConfig{
 		ID:          s.ID,
 		Kernel:      s.KernelPath,
 		Initrd:      s.InitrdPath,
 		Rootfs:      s.RootfsPath,
-		OverlayDir:  s.OverlayPath[:len(s.OverlayPath)-len("/"+s.ID+".qcow2")],
+		OverlayDir:  overlayDir,
 		Memory:      s.Memory,
 		CPUs:        s.CPUs,
 		Network: backend.NetworkConfig{
@@ -692,6 +852,7 @@ func stateToVMConfig(s *state.VMState) *backend.VMConfig {
 		SSHPubKey:   readSSHPubKey(s.SSHKeyPath),
 		SSHPort:     s.SSHPort,
 		Services:    stateServicesToBackend(s.Services),
+		DiskSize:    s.DiskSize,
 	}
 }
 
@@ -735,11 +896,13 @@ func stateUsersToBackend(users []state.UserState) []backend.User {
 // stateToVM converts persisted state to the backend VM handle.
 func stateToVM(s *state.VMState) *backend.VM {
 	return &backend.VM{
-		ID:         s.ID,
-		OverlayImg: s.OverlayPath,
-		CtrlSocket: s.SocketPath,
-		SSHPort:    s.SSHPort,
-		Pid:        s.Pid,
+		ID:          s.ID,
+		OverlayImg:  s.OverlayPath,
+		DataDiskImg: s.DataDiskPath,
+		QMPSocket:   s.QMPSocketPath,
+		CtrlSocket:  s.SocketPath,
+		SSHPort:     s.SSHPort,
+		Pid:         s.Pid,
 	}
 }
 

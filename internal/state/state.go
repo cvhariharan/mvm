@@ -35,12 +35,15 @@ type VMState struct {
 	KernelPath  string `json:"kernel_path"`
 	InitrdPath  string `json:"initrd_path"`
 	RootfsPath  string `json:"rootfs_path"`
-	OverlayPath string `json:"overlay_path"`
-	SocketPath string `json:"socket_path"` // control channel
+	OverlayPath   string `json:"overlay_path"`            // legacy qcow2 overlay (old VMs)
+	DataDiskPath  string `json:"data_disk_path,omitempty"`  // raw data disk for overlayfs
+	QMPSocketPath string `json:"qmp_socket_path,omitempty"` // QMP socket for block_resize
+	SocketPath    string `json:"socket_path"`               // control channel
 	SSHPort    int    `json:"ssh_port,omitempty"`
 	SSHKeyPath string `json:"ssh_key_path,omitempty"`
 
 	// VM configuration (needed to rebuild QEMU args on restart)
+	DiskSize  string            `json:"disk_size,omitempty"`
 	Memory    string            `json:"memory"`
 	CPUs      int               `json:"cpus"`
 	Network   NetworkState      `json:"network"`
@@ -53,6 +56,14 @@ type VMState struct {
 	Shell       string            `json:"shell,omitempty"`
 	Users       []UserState       `json:"users,omitempty"`
 	Services    []ServiceState    `json:"services,omitempty"`
+	Snapshots   []SnapshotState   `json:"snapshots,omitempty"`
+}
+
+// SnapshotState tracks a file-level snapshot of the data disk.
+type SnapshotState struct {
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+	Path      string    `json:"path"`
 }
 
 type ServiceState struct {

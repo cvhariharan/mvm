@@ -120,6 +120,7 @@ var pkgNames = map[pkgManager]map[string]string{
 		"wget":       "wget",
 		"procps":     "procps-ng",
 		"openssh":    "openssh",
+		"e2fsprogs":  "e2fsprogs",
 	},
 	pkgManagerAptGet: {
 		"shadow":     "passwd",
@@ -130,6 +131,7 @@ var pkgNames = map[pkgManager]map[string]string{
 		"wget":       "wget",
 		"procps":     "procps",
 		"openssh":    "openssh-server",
+		"e2fsprogs":  "e2fsprogs",
 	},
 	pkgManagerDnf: {
 		"shadow":     "shadow-utils",
@@ -140,6 +142,7 @@ var pkgNames = map[pkgManager]map[string]string{
 		"wget":       "wget",
 		"procps":     "procps-ng",
 		"openssh":    "openssh-server",
+		"e2fsprogs":  "e2fsprogs",
 	},
 	pkgManagerMicrodnf: {
 		"shadow":     "shadow-utils",
@@ -150,6 +153,7 @@ var pkgNames = map[pkgManager]map[string]string{
 		"wget":       "wget",
 		"procps":     "procps-ng",
 		"openssh":    "openssh-server",
+		"e2fsprogs":  "e2fsprogs",
 	},
 	pkgManagerPacman: {
 		"shadow":     "shadow",
@@ -160,6 +164,7 @@ var pkgNames = map[pkgManager]map[string]string{
 		"wget":       "wget",
 		"procps":     "procps-ng",
 		"openssh":    "openssh",
+		"e2fsprogs":  "e2fsprogs",
 	},
 	pkgManagerEmerge: {
 		"shadow":     "sys-apps/shadow",
@@ -170,6 +175,7 @@ var pkgNames = map[pkgManager]map[string]string{
 		"wget":       "net-misc/wget",
 		"procps":     "sys-process/procps",
 		"openssh":    "net-misc/openssh",
+		"e2fsprogs":  "sys-fs/e2fsprogs",
 	},
 }
 
@@ -247,7 +253,7 @@ func installShellAndTools(pm pkgManager, shell string) (string, error) {
 	}
 
 	// Build the list of tool packages for this distro.
-	tools := []string{"shadow", "sudo", "findutils", "util-linux", "curl", "wget", "procps", "openssh"}
+	tools := []string{"shadow", "sudo", "findutils", "util-linux", "curl", "wget", "procps", "openssh", "e2fsprogs"}
 	var pkgs []string
 	for _, t := range tools {
 		if n, ok := names[t]; ok {
@@ -315,7 +321,8 @@ func run() error {
 		if rootDev == "" {
 			return fmt.Errorf("no root= on kernel cmdline")
 		}
-		if err := bootFromInitrd(rootDev, mvmWS, mvmMounts); err != nil {
+		dataDev := params["mvm.datadev"]
+		if err := bootFromInitrd(rootDev, dataDev, mvmWS, mvmMounts); err != nil {
 			return err
 		}
 	} else {
@@ -395,7 +402,7 @@ func run() error {
 		Services: svcManager.RunningNames(),
 	})})
 
-	// Start ctrl message dispatcher (shutdown only — exec/resize handled by SSH)
+	// Start ctrl message dispatcher
 	shutdownCh := dispatchCtrl(ctrl)
 
 	// Wait for explicit shutdown message from host. If the ctrl channel
@@ -425,7 +432,8 @@ func dispatchCtrl(ctrl io.ReadWriteCloser) <-chan struct{} {
 			if err := dec.Decode(&msg); err != nil {
 				return // ctrl channel closed — VM keeps running
 			}
-			if msg.Type == proto.TypeShutdown {
+			switch msg.Type {
+			case proto.TypeShutdown:
 				select {
 				case shutdownCh <- struct{}{}:
 				default:
@@ -635,14 +643,52 @@ func mountEssential() {
 	}
 }
 
-func bootFromInitrd(rootDev, mvmWS string, extraMounts []extraMount) error {
+func bootFromInitrd(rootDev, dataDev, mvmWS string, extraMounts []extraMount) error {
 	if err := waitForDevice(rootDev, 10*time.Second); err != nil {
 		return fmt.Errorf("waiting for %s: %w", rootDev, err)
 	}
 
 	os.MkdirAll(newRoot, 0755)
-	if err := syscall.Mount(rootDev, newRoot, "ext4", 0, ""); err != nil {
-		return fmt.Errorf("mount rootfs: %w", err)
+
+	if dataDev != "" {
+		// New overlayfs boot: immutable rootfs + writable data disk
+		if err := waitForDevice(dataDev, 10*time.Second); err != nil {
+			return fmt.Errorf("waiting for %s: %w", dataDev, err)
+		}
+
+		const (
+			mntRootfs = "/mnt/rootfs"
+			mntData   = "/mnt/data"
+		)
+		os.MkdirAll(mntRootfs, 0755)
+		os.MkdirAll(mntData, 0755)
+
+		// Mount rootfs read-only
+		if err := syscall.Mount(rootDev, mntRootfs, "ext4", syscall.MS_RDONLY, ""); err != nil {
+			return fmt.Errorf("mount rootfs ro: %w", err)
+		}
+
+		// Mount data disk read-write
+		if err := syscall.Mount(dataDev, mntData, "ext4", 0, ""); err != nil {
+			return fmt.Errorf("mount data disk: %w", err)
+		}
+
+		// Prepare overlay directories on data disk
+		upperDir := filepath.Join(mntData, "upper")
+		workDir := filepath.Join(mntData, "work")
+		os.MkdirAll(upperDir, 0755)
+		os.MkdirAll(workDir, 0755)
+
+		// Mount overlayfs
+		overlayOpts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", mntRootfs, upperDir, workDir)
+		if err := syscall.Mount("overlay", newRoot, "overlay", 0, overlayOpts); err != nil {
+			return fmt.Errorf("mount overlayfs: %w", err)
+		}
+	} else {
+		// Legacy boot: single rw rootfs
+		if err := syscall.Mount(rootDev, newRoot, "ext4", 0, ""); err != nil {
+			return fmt.Errorf("mount rootfs: %w", err)
+		}
 	}
 
 	if mvmWS != "" {
@@ -664,6 +710,19 @@ func bootFromInitrd(rootDev, mvmWS string, extraMounts []extraMount) error {
 
 	for _, dir := range []string{"proc", "sys", "dev", "dev/pts", "run", "tmp"} {
 		os.MkdirAll(filepath.Join(newRoot, dir), 0755)
+	}
+
+	// Move the underlying data and rootfs mounts into newroot so they
+	// remain accessible after switch_root. This is needed for resize2fs
+	// to operate on the data device while it is mounted.
+	if dataDev != "" {
+		for _, mp := range []string{"/mnt/data", "/mnt/rootfs"} {
+			target := filepath.Join(newRoot, mp)
+			os.MkdirAll(target, 0755)
+			if err := syscall.Mount(mp, target, "", syscall.MS_MOVE, ""); err != nil {
+				fmt.Fprintf(os.Stderr, "move mount %s: %v\n", mp, err)
+			}
+		}
 	}
 
 	// Copy supervisord binary from initrd to rootfs before chroot.

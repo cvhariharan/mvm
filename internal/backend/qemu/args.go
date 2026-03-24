@@ -35,11 +35,25 @@ func buildArgs(cfg *backend.VMConfig, vm *backend.VM) ([]string, error) {
 	// Serial console to stdio for boot diagnostics (non-interactive)
 	args = append(args, "-serial", "stdio")
 
-	// Root drive (qcow2 overlay)
-	args = append(args,
-		"-drive", fmt.Sprintf("id=root,file=%s,format=qcow2,if=none", vm.OverlayImg),
-		"-device", "virtio-blk-device,drive=root",
-	)
+	if vm.DataDiskImg != "" {
+		// New two-disk layout: immutable rootfs + writable data disk
+		args = append(args,
+			"-drive", fmt.Sprintf("id=rootfs,file=%s,format=raw,if=none,readonly=on", cfg.Rootfs),
+			"-device", "virtio-blk-device,drive=rootfs",
+			"-drive", fmt.Sprintf("id=data,file=%s,format=raw,if=none", vm.DataDiskImg),
+			"-device", "virtio-blk-device,drive=data",
+		)
+		// QMP socket for block_resize (live disk resize)
+		args = append(args,
+			"-qmp", fmt.Sprintf("unix:%s,server,nowait", vm.QMPSocket),
+		)
+	} else {
+		// Legacy single-disk layout (qcow2 overlay)
+		args = append(args,
+			"-drive", fmt.Sprintf("id=root,file=%s,format=qcow2,if=none", vm.OverlayImg),
+			"-device", "virtio-blk-device,drive=root",
+		)
+	}
 
 	// Control channel via virtio-serial unix socket
 	args = append(args,
@@ -116,7 +130,14 @@ func buildCmdline(cfg *backend.VMConfig) string {
 		"loglevel=0",
 		"no_timer_check",
 		"root=/dev/vda",
-		"rw",
+	}
+
+	if cfg.DiskSize != "" {
+		// New overlayfs mode: rootfs is read-only, data disk provides writable overlay
+		parts = append(parts, "ro", "mvm.datadev=/dev/vdb")
+	} else {
+		// Legacy mode: single qcow2 disk, mounted read-write
+		parts = append(parts, "rw")
 	}
 
 	if cfg.UID != "" {
