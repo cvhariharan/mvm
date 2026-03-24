@@ -93,6 +93,13 @@ var sshCmd = &cobra.Command{
 	RunE:  runSSH,
 }
 
+var waypipeCmd = &cobra.Command{
+	Use:   "waypipe [id-or-name] <app> [app-args...]",
+	Short: "Run a GUI application in the microVM, forwarding the display to the host via waypipe",
+	Args:  cobra.MinimumNArgs(1),
+	RunE:  runWaypipe,
+}
+
 var rmCmd = &cobra.Command{
 	Use:   "rm <id-or-name>",
 	Short: "Remove a stopped microVM",
@@ -218,6 +225,7 @@ func init() {
 	sshCmd.Flags().BoolVar(&flagSSHCode, "code", false, "open VS Code connected to the VM")
 	sshCmd.Flags().BoolVar(&flagSSHZed, "zed", false, "open Zed connected to the VM")
 	rootCmd.AddCommand(sshCmd)
+	rootCmd.AddCommand(waypipeCmd)
 	rootCmd.AddCommand(stopCmd)
 	rootCmd.AddCommand(rmCmd)
 	rootCmd.AddCommand(psCmd)
@@ -504,6 +512,7 @@ type sshConnInfo struct {
 	Port     int
 	KeyPath  string
 	Username string
+	UID      int    // guest user UID (for XDG_RUNTIME_DIR)
 	WorkDir  string // guest workspace directory (may be empty)
 }
 
@@ -549,14 +558,17 @@ func resolveSSHInfo(targetID string) (*sshConnInfo, error) {
 		return nil, err
 	}
 	username := "root"
+	uid := 0
 	if len(vmState.Users) > 0 {
 		username = vmState.Users[0].Name
+		uid = vmState.Users[0].UID
 	}
 
 	return &sshConnInfo{
 		Port:     port,
 		KeyPath:  keyPath,
 		Username: username,
+		UID:      uid,
 		WorkDir:  vmState.Workspace.GuestDir,
 	}, nil
 }
@@ -645,6 +657,61 @@ func runSSH(cmd *cobra.Command, args []string) error {
 	return syscall.Exec(sshBin, sshArgs, os.Environ())
 }
 
+func runWaypipe(cmd *cobra.Command, args []string) error {
+	waypipeBin, err := exec.LookPath("waypipe")
+	if err != nil {
+		return fmt.Errorf("waypipe not found in PATH")
+	}
+
+	// First arg may be a VM id/name; if it looks like one (no path separators
+	// and not the app itself), treat it as the target. We try to resolve it and
+	// fall back to the current workspace VM if resolution fails, using the
+	// first arg as the app name instead.
+	var targetID string
+	var appArgs []string
+
+	info, err := resolveSSHInfo(args[0])
+	if err != nil {
+		// args[0] failed to resolve as a VM — treat it as the app to run on
+		// the current workspace VM.
+		info, err = resolveSSHInfo("")
+		if err != nil {
+			return err
+		}
+		appArgs = args
+	} else {
+		if len(args) < 2 {
+			return fmt.Errorf("usage: mvm waypipe [id-or-name] <app> [app-args...]")
+		}
+		targetID = args[0]
+		_ = targetID
+		appArgs = args[1:]
+	}
+
+	if _, err := writeSSHConfig(info); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not write ssh config: %v\n", err)
+	}
+
+	// waypipe ssh <ssh-args> user@host <app> [app-args...]
+	// --no-gpu: suppress Vulkan/DMABuf errors when the guest has no GPU driver.
+	// --display: explicitly point waypipe at the host Wayland socket so it
+	//   works even if WAYLAND_DISPLAY is not inherited through syscall.Exec.
+	// SetEnv: deliver XDG_RUNTIME_DIR to the guest so waypipe-server and the
+	//   app can find the forwarded socket.
+	xdgRuntimeDir := fmt.Sprintf("/run/user/%d", info.UID)
+	waylandDisplay := os.Getenv("WAYLAND_DISPLAY")
+	if waylandDisplay == "" {
+		waylandDisplay = "wayland-0"
+	}
+	wpArgs := []string{"waypipe", "--no-gpu", "--display", waylandDisplay, "ssh"}
+	wpArgs = append(wpArgs, info.baseSSHArgs()...)
+	wpArgs = append(wpArgs, "-o", "SetEnv XDG_RUNTIME_DIR="+xdgRuntimeDir)
+	wpArgs = append(wpArgs, info.sshHostStr())
+	wpArgs = append(wpArgs, appArgs...)
+
+	return syscall.Exec(waypipeBin, wpArgs, os.Environ())
+}
+
 // writeSSHConfig writes an SSH config file for the VM so that editors can
 // connect using the host alias "mvm". Returns the config file path.
 func writeSSHConfig(info *sshConnInfo) (string, error) {
@@ -667,6 +734,7 @@ func writeSSHConfig(info *sshConnInfo) (string, error) {
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
     LogLevel ERROR
+    StreamLocalBindUnlink yes
 `, info.Port, info.Username, info.KeyPath)
 
 	if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {

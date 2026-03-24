@@ -477,9 +477,10 @@ PermitRootLogin no
 PubkeyAuthentication yes
 PasswordAuthentication no
 KbdInteractiveAuthentication no
-X11Forwarding no
+X11Forwarding yes
 PrintMotd no
-AcceptEnv LANG LC_* TERM COLORTERM
+AcceptEnv LANG LC_* TERM COLORTERM WAYLAND_DISPLAY XDG_RUNTIME_DIR
+StreamLocalBindUnlink yes
 Subsystem sftp internal-sftp
 `
 	writeFile("/etc/ssh/sshd_config", sshdConfig, 0644)
@@ -503,6 +504,10 @@ Subsystem sftp internal-sftp
 		akPath := sshDir + "/authorized_keys"
 		os.WriteFile(akPath, []byte(authorizedLine+"\n"), 0600)
 		os.Chown(akPath, u.UID, u.GID)
+
+		runtimeDir := fmt.Sprintf("/run/user/%d", u.UID)
+		os.MkdirAll(runtimeDir, 0700)
+		os.Chown(runtimeDir, u.UID, u.GID)
 	}
 
 	os.MkdirAll("/run/sshd", 0755)
