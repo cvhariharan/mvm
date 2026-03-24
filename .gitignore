@@ -1,4 +1,4 @@
-testdata/
+testdata/bzImage
 .mvm
 bin/
 internal/initrd/initrd.img
