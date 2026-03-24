@@ -209,6 +209,15 @@ func (m *Manager) Start(ctx context.Context, id string, foreground bool) (int, e
 		return 1, fmt.Errorf("vm %s is already running (pid %d)", vmState.ID, vmState.Pid)
 	}
 
+	// Re-allocate SSH port — the previous port may still be in TIME_WAIT
+	// after QEMU was terminated, causing QEMU's slirp to silently fail
+	// to bind it.
+	sshPort, err := qemu.AllocateSSHPort()
+	if err != nil {
+		return 1, fmt.Errorf("allocate ssh port: %w", err)
+	}
+	vmState.SSHPort = sshPort
+
 	vmCfg := stateToVMConfig(vmState)
 	vm := stateToVM(vmState)
 

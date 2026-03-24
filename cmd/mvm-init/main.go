@@ -359,6 +359,9 @@ func run() error {
 			}
 		}
 		writeFile(installMarker, "", 0644)
+		// Flush all pending writes to the block device so the marker and
+		// installed packages survive even if QEMU is later killed ungracefully.
+		syscall.Sync()
 	}
 
 	createUsers(mvmUsers, shell)

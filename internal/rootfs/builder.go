@@ -60,28 +60,30 @@ func (b *Builder) Get(ctx context.Context, imageName string) (string, error) {
 }
 
 // resolveImageID ensures the image exists locally (pulling if needed) and
-// returns its content-addressable ID.
+// returns its content-addressable ID. It always attempts a pull first so that
+// remote image updates are picked up. For local-only images the pull fails
+// and we fall back to inspecting the local daemon.
 func (b *Builder) resolveImageID(ctx context.Context, imageName string) (string, error) {
-	inspect, err := b.client.ImageInspect(ctx, imageName)
-	if err == nil {
+	// Always try to pull so remote images stay up-to-date.
+	bar := newSpinner("Pulling " + imageName)
+	resp, pullErr := b.client.ImagePull(ctx, imageName, client.ImagePullOptions{})
+	if pullErr == nil {
+		pullErr = resp.Wait(ctx)
+	}
+	bar.Finish()
+
+	if pullErr == nil {
+		inspect, err := b.client.ImageInspect(ctx, imageName)
+		if err != nil {
+			return "", fmt.Errorf("failed to inspect image after pull: %w", err)
+		}
 		return inspect.ID, nil
 	}
 
-	bar := newSpinner("Pulling " + imageName)
-	resp, err := b.client.ImagePull(ctx, imageName, client.ImagePullOptions{})
+	// Pull failed — fall back to local image (offline / local-only).
+	inspect, err := b.client.ImageInspect(ctx, imageName)
 	if err != nil {
-		bar.Finish()
-		return "", fmt.Errorf("failed to pull image: %w", err)
-	}
-	pullErr := resp.Wait(ctx)
-	bar.Finish()
-	if pullErr != nil {
 		return "", fmt.Errorf("failed to pull image: %w", pullErr)
-	}
-
-	inspect, err = b.client.ImageInspect(ctx, imageName)
-	if err != nil {
-		return "", fmt.Errorf("failed to inspect image after pull: %w", err)
 	}
 	return inspect.ID, nil
 }

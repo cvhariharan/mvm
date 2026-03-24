@@ -42,26 +42,10 @@ func (p *Puller) Pull(ref string) (string, error) {
 	}
 	defer cli.Close()
 
-	// Resolve image to its ID so the cache is keyed by content, not tag.
-	inspect, err := cli.ImageInspect(ctx, ref)
+	imageID, err := resolveImageID(ctx, cli, ref)
 	if err != nil {
-		fmt.Printf("Pulling kernel %s...\n", ref)
-		resp, err := cli.ImagePull(ctx, ref, client.ImagePullOptions{})
-		if err != nil {
-			return "", fmt.Errorf("failed to pull kernel image: %w", err)
-		}
-		io.Copy(io.Discard, resp)
-		resp.Close()
-
-		inspect, err = cli.ImageInspect(ctx, ref)
-		if err != nil {
-			return "", fmt.Errorf("failed to inspect kernel image after pull: %w", err)
-		}
-	} else {
-		fmt.Printf("Using local image %s\n", ref)
+		return "", err
 	}
-
-	imageID := inspect.ID
 
 	// Check cache using image ID (not the mutable tag)
 	if p.cache.Exists(imageID, kernelFilename) {
@@ -103,6 +87,34 @@ func (p *Puller) Pull(ref string) (string, error) {
 
 	fmt.Printf("Kernel cached at %s\n", kernelPath)
 	return kernelPath, nil
+}
+
+// resolveImageID ensures the image exists locally (pulling if needed) and
+// returns its content-addressable ID. It always attempts a pull first so that
+// remote image updates are picked up. For local-only images the pull fails
+// and we fall back to inspecting the local daemon.
+func resolveImageID(ctx context.Context, cli *client.Client, ref string) (string, error) {
+	fmt.Printf("Pulling kernel %s...\n", ref)
+	resp, pullErr := cli.ImagePull(ctx, ref, client.ImagePullOptions{})
+	if pullErr == nil {
+		pullErr = resp.Wait(ctx)
+	}
+
+	if pullErr == nil {
+		inspect, err := cli.ImageInspect(ctx, ref)
+		if err != nil {
+			return "", fmt.Errorf("failed to inspect kernel image after pull: %w", err)
+		}
+		return inspect.ID, nil
+	}
+
+	// Pull failed — fall back to local image (offline / local-only).
+	inspect, err := cli.ImageInspect(ctx, ref)
+	if err != nil {
+		return "", fmt.Errorf("failed to pull kernel image: %w", pullErr)
+	}
+	fmt.Printf("Using local image %s\n", ref)
+	return inspect.ID, nil
 }
 
 // Get returns the path to a cached kernel, pulling it if necessary.
