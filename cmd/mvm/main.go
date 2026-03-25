@@ -658,11 +658,6 @@ func runSSH(cmd *cobra.Command, args []string) error {
 }
 
 func runWaypipe(cmd *cobra.Command, args []string) error {
-	waypipeBin, err := exec.LookPath("waypipe")
-	if err != nil {
-		return fmt.Errorf("waypipe not found in PATH")
-	}
-
 	// First arg may be a VM id/name; if it looks like one (no path separators
 	// and not the app itself), treat it as the target. We try to resolve it and
 	// fall back to the current workspace VM if resolution fails, using the
@@ -709,7 +704,11 @@ func runWaypipe(cmd *cobra.Command, args []string) error {
 	wpArgs = append(wpArgs, info.sshHostStr())
 	wpArgs = append(wpArgs, appArgs...)
 
-	return syscall.Exec(waypipeBin, wpArgs, os.Environ())
+	c := exec.Command(wpArgs[0], wpArgs[1:]...)
+	c.Stdin = os.Stdin
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+	return c.Run()
 }
 
 // writeSSHConfig writes an SSH config file for the VM so that editors can
