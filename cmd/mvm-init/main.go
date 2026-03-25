@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -689,6 +690,22 @@ func bootFromInitrd(rootDev, dataDev, mvmWS string, extraMounts []extraMount) er
 		if err := syscall.Mount("overlay", newRoot, "overlay", 0, overlayOpts); err != nil {
 			return fmt.Errorf("mount overlayfs: %w", err)
 		}
+
+		// Bind-mount /var from the real ext4 data disk so that tools like Docker can
+		// use overlayfs for their own layered filesystems. overlay-on-overlay is
+		// rejected by the kernel; /var needs to sit on a native filesystem.
+		varData := filepath.Join(mntData, "var")
+		varGuest := filepath.Join(newRoot, "var")
+		if _, err := os.Stat(varData); os.IsNotExist(err) {
+			// First boot: seed /var on the data disk from the rootfs image so
+			// existing content (logs dirs, lib dirs, etc.) is preserved.
+			if err := copyDir(varGuest, varData); err != nil {
+				fmt.Fprintf(os.Stderr, "seed /var on data disk: %v\n", err)
+			}
+		}
+		if err := syscall.Mount(varData, varGuest, "", syscall.MS_BIND, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "bind mount /var from data disk: %v\n", err)
+		}
 	} else {
 		// Legacy boot: single rw rootfs
 		if err := syscall.Mount(rootDev, newRoot, "ext4", 0, ""); err != nil {
@@ -863,6 +880,43 @@ func copyFile(src, dst string) {
 	}
 	os.MkdirAll(filepath.Dir(dst), 0755)
 	os.WriteFile(dst, data, 0755)
+}
+
+// copyDir recursively copies src into dst, preserving permissions.
+// Used to seed directories from the rootfs image onto the data disk on first boot.
+func copyDir(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(src, path)
+		target := filepath.Join(dst, rel)
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			link, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(link, target)
+		}
+		if d.IsDir() {
+			return os.MkdirAll(target, info.Mode())
+		}
+		copyFile(path, target)
+		return nil
+	})
+}
+
+// mkdirIfNotExists creates dir only if it does not already exist, avoiding
+// an overlayfs copy-up that would overwrite the original image permissions.
+func mkdirIfNotExists(dir string, mode os.FileMode) error {
+	if _, err := os.Stat(dir); err == nil {
+		return nil
+	}
+	return os.Mkdir(dir, mode)
 }
 
 func decodeEnv(encoded string) map[string]string {
