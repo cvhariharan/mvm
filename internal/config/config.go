@@ -101,12 +101,9 @@ func Load(projectDir string) (*Config, error) {
 	k := koanf.New(".")
 	parser := toml.Parser()
 
-	// Layer 1: hardcoded defaults
 	if err := k.Load(confmap.Provider(defaults, "."), nil); err != nil {
 		return nil, err
 	}
-
-	// Layer 2: global config ~/.config/mvm/config.toml
 	if home, err := os.UserHomeDir(); err == nil {
 		globalPath := filepath.Join(home, ".config", "mvm", "config.toml")
 		if _, err := os.Stat(globalPath); err == nil {
@@ -116,7 +113,6 @@ func Load(projectDir string) (*Config, error) {
 		}
 	}
 
-	// Layer 3: per-project .mvm
 	projectPath := filepath.Join(projectDir, ConfigFile)
 	if _, err := os.Stat(projectPath); err == nil {
 		if err := k.Load(file.Provider(projectPath), parser); err != nil {
@@ -137,14 +133,12 @@ func Save(dir string) error {
 	path := filepath.Join(dir, ConfigFile)
 	content := `[vm]
 image = "alpine:latest"
-kernel = "ghcr.io/mvm/kernel:latest"
+kernel = "ghcr.io/cvhariharan/mvm-kernel:latest"
 memory = "512M"
 cpus = 2
 shell = "bash"
 disk = "4G"
 
-[network]
-mode = "slirp"
 # [[network.ports]]
 # host = 8080
 # guest = 80
@@ -165,10 +159,8 @@ mount_workspace = true
 
 # [[services]]
 # name = "dockerd"
-# cmd = "/usr/bin/dockerd"
+# cmd = "/usr/bin/dockerd --userland-proxy=false"
 # restart = true
-# # oneshot = false
-# # after = "other-service"
 `
 	return os.WriteFile(path, []byte(content), 0644)
 }

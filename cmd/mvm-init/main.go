@@ -323,7 +323,7 @@ func run() error {
 			return fmt.Errorf("no root= on kernel cmdline")
 		}
 		dataDev := params["mvm.datadev"]
-		if err := bootFromInitrd(rootDev, dataDev, mvmWS, mvmMounts); err != nil {
+		if err := bootFromInitrd(rootDev, dataDev, mvmWS, mvmHostname, mvmMounts); err != nil {
 			return err
 		}
 	} else {
@@ -337,7 +337,7 @@ func run() error {
 		}
 		mountExtra(mvmMounts, "")
 		writeFile("/etc/resolv.conf", "nameserver 10.0.2.3\n", 0644)
-		writeFile("/etc/hosts", "127.0.0.1 localhost\n::1 localhost\n", 0644)
+		writeFile("/etc/hosts", hostsContent(mvmHostname), 0644)
 	}
 
 	// File mounts: mount 9p parent dirs on /run (safe after mountEssential),
@@ -649,7 +649,7 @@ func mountEssential() {
 	}
 }
 
-func bootFromInitrd(rootDev, dataDev, mvmWS string, extraMounts []extraMount) error {
+func bootFromInitrd(rootDev, dataDev, mvmWS, hostname string, extraMounts []extraMount) error {
 	if err := waitForDevice(rootDev, 10*time.Second); err != nil {
 		return fmt.Errorf("waiting for %s: %w", rootDev, err)
 	}
@@ -727,8 +727,7 @@ func bootFromInitrd(rootDev, dataDev, mvmWS string, extraMounts []extraMount) er
 
 	writeFile(filepath.Join(newRoot, "etc/resolv.conf"),
 		"nameserver 10.0.2.3\n", 0644)
-	writeFile(filepath.Join(newRoot, "etc/hosts"),
-		"127.0.0.1 localhost\n::1 localhost\n", 0644)
+	writeFile(filepath.Join(newRoot, "etc/hosts"), hostsContent(hostname), 0644)
 
 	for _, dir := range []string{"proc", "sys", "dev", "dev/pts", "run", "tmp"} {
 		os.MkdirAll(filepath.Join(newRoot, dir), 0755)
@@ -854,6 +853,13 @@ func waitForDevice(path string, timeout time.Duration) error {
 		time.Sleep(10 * time.Millisecond)
 	}
 	return fmt.Errorf("device %s did not appear within %s", path, timeout)
+}
+
+func hostsContent(hostname string) string {
+	if hostname != "" {
+		return "127.0.0.1 localhost " + hostname + "\n::1 localhost " + hostname + "\n"
+	}
+	return "127.0.0.1 localhost\n::1 localhost\n"
 }
 
 func writeFile(path, content string, mode os.FileMode) {

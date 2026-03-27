@@ -115,12 +115,9 @@ func (b *Builder) build(ctx context.Context, imageName, imageID string) (string,
 		return "", err
 	}
 
-	bar := newSpinner("Building ext4 image")
 	if err := b.createExt4Image(rootfsTar, rootfsImg); err != nil {
-		bar.Close()
 		return "", err
 	}
-	bar.Finish()
 
 	// Move result into cache, keyed by image ID
 	if err := b.cache.EnsureDir(imageID); err != nil {
@@ -153,17 +150,19 @@ func (b *Builder) exportContainer(ctx context.Context, containerID, destPath str
 	if err != nil {
 		return fmt.Errorf("failed to export container: %w", err)
 	}
-	defer resp.Close()
 
 	f, err := os.Create(destPath)
 	if err != nil {
+		resp.Close()
 		return err
 	}
 	defer f.Close()
 
-	bar := newSpinner("Exporting container")
-	_, err = io.Copy(f, resp)
-	bar.Finish()
+	bar := newByteCounter("Exporting container")
+	reader := progressbar.NewReader(resp, bar)
+	defer reader.Close()
+
+	_, err = io.Copy(f, &reader)
 	return err
 }
 
@@ -176,23 +175,28 @@ func (b *Builder) createExt4Image(tarPath, imagePath string) error {
 	if err != nil {
 		return fmt.Errorf("open tar: %w", err)
 	}
-	defer tarFile.Close()
 
 	imgFile, err := os.Create(imagePath)
 	if err != nil {
+		tarFile.Close()
 		return fmt.Errorf("create image: %w", err)
 	}
 	defer imgFile.Close()
 
 	// Add 20% for ext4 metadata overhead. The rootfs is mounted
 	// read-only (overlayfs lowerdir), so no extra space is needed.
-	size := tarSize(tarPath) * 120 / 100
-	if minSize := int64(256) << 20; size < minSize {
-		size = minSize // 256MB minimum
+	tarFileSize := tarSize(tarPath)
+	diskSize := tarFileSize * 120 / 100
+	if minSize := int64(256) << 20; diskSize < minSize {
+		diskSize = minSize // 256MB minimum
 	}
 
-	if err := tar2ext4.ConvertTarToExt4(tarFile, imgFile,
-		tar2ext4.MaximumDiskSize(size),
+	bar := newByteBar(tarFileSize, "Building ext4 image")
+	reader := progressbar.NewReader(tarFile, bar)
+	defer reader.Close()
+
+	if err := tar2ext4.ConvertTarToExt4(&reader, imgFile,
+		tar2ext4.MaximumDiskSize(diskSize),
 		tar2ext4.ConvertWhiteout,
 		tar2ext4.InlineData,
 	); err != nil {
@@ -202,7 +206,7 @@ func (b *Builder) createExt4Image(tarPath, imagePath string) error {
 	// Expand the image to the target size — compactext4 creates a
 	// minimally-sized image, so we truncate to grow and resize2fs
 	// to make the filesystem span the full image.
-	if err := imgFile.Truncate(size); err != nil {
+	if err := imgFile.Truncate(diskSize); err != nil {
 		return fmt.Errorf("truncate image: %w", err)
 	}
 	imgFile.Close()
@@ -246,6 +250,15 @@ func newByteBar(total int64, desc string) *progressbar.ProgressBar {
 		progressbar.OptionSetDescription(desc),
 		progressbar.OptionShowBytes(true),
 		progressbar.OptionSetWidth(30),
+		progressbar.OptionClearOnFinish(),
+	)
+}
+
+func newByteCounter(desc string) *progressbar.ProgressBar {
+	return progressbar.NewOptions64(-1,
+		progressbar.OptionSetDescription(desc),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionSpinnerType(14),
 		progressbar.OptionClearOnFinish(),
 	)
 }
