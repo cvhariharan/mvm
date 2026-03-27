@@ -40,19 +40,6 @@ var rootCmd = &cobra.Command{
 	Long:  "A simple tool to create microvms for development sandboxes",
 }
 
-var runCmd = &cobra.Command{
-	Use:   "run [flags] -- <command> [args...]",
-	Short: "Run a command in an ephemeral microVM",
-	Args:  cobra.ArbitraryArgs,
-	RunE:  runRun,
-}
-
-var shellCmd = &cobra.Command{
-	Use:   "shell",
-	Short: "Start an interactive shell in a microVM (alias for: run)",
-	RunE:  runRun,
-}
-
 var createCmd = &cobra.Command{
 	Use:   "create [flags] [-- <command> [args...]]",
 	Short: "Create a microVM without starting it",
@@ -203,22 +190,18 @@ var kernelListCmd = &cobra.Command{
 }
 
 func init() {
-	for _, cmd := range []*cobra.Command{runCmd, shellCmd, buildCmd, createCmd, upCmd, rebuildCmd} {
+	for _, cmd := range []*cobra.Command{buildCmd, createCmd, upCmd, rebuildCmd} {
 		cmd.Flags().StringVar(&flagImage, "image", "", "container image")
 		cmd.Flags().StringVar(&flagMemory, "memory", "", "memory size (e.g. 512M)")
 		cmd.Flags().IntVar(&flagCPUs, "cpus", 0, "number of CPUs")
 	}
 
-	for _, cmd := range []*cobra.Command{runCmd, createCmd, shellCmd} {
-		cmd.Flags().StringVar(&flagName, "name", "", "name for the VM")
-	}
+	createCmd.Flags().StringVar(&flagName, "name", "", "name for the VM")
 
 	startCmd.Flags().BoolVarP(&flagDetach, "detach", "d", false, "run in background")
 	upCmd.Flags().BoolVarP(&flagDetach, "detach", "d", false, "run in background")
 	rmCmd.Flags().BoolVarP(&flagForce, "force", "f", false, "stop the VM first if running")
 
-	rootCmd.AddCommand(runCmd)
-	rootCmd.AddCommand(shellCmd)
 	rootCmd.AddCommand(createCmd)
 	rootCmd.AddCommand(startCmd)
 	rootCmd.AddCommand(attachCmd)
@@ -280,30 +263,6 @@ func createManager(cfg *config.Config, workDir string) (*vm.Manager, error) {
 		return nil, fmt.Errorf("state store: %w", err)
 	}
 	return vm.NewManager(b, cfg, workDir, store), nil
-}
-
-func runRun(cmd *cobra.Command, args []string) error {
-	cfg, workDir, err := loadConfig()
-	if err != nil {
-		return err
-	}
-
-	command := "/bin/sh"
-	if len(args) > 0 {
-		command = strings.Join(args, " ")
-	}
-
-	mgr, err := createManager(cfg, workDir)
-	if err != nil {
-		return err
-	}
-
-	exitCode, err := mgr.Run(context.Background(), command)
-	if err != nil {
-		return err
-	}
-	os.Exit(exitCode)
-	return nil
 }
 
 func runUp(cmd *cobra.Command, args []string) error {

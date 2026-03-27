@@ -26,9 +26,8 @@ import (
 )
 
 type CreateOpts struct {
-	Name      string
-	Command   string
-	Ephemeral bool // if true, state is never written to the store
+	Name    string
+	Command string
 }
 
 type Manager struct {
@@ -188,12 +187,8 @@ func (m *Manager) Create(ctx context.Context, opts CreateOpts) (*state.VMState, 
 		return nil, fmt.Errorf("create vm: %w", err)
 	}
 
-	if opts.Ephemeral {
-		// VM dir already created for SSH keys above.
-	} else {
-		if err := m.store.Save(vmState); err != nil {
-			return nil, fmt.Errorf("save state: %w", err)
-		}
+	if err := m.store.Save(vmState); err != nil {
+		return nil, fmt.Errorf("save state: %w", err)
 	}
 
 	return vmState, nil
@@ -536,40 +531,6 @@ func resolveSize(diskPath, size string) (int64, error) {
 	return newSize, nil
 }
 
-
-// Run is the ephemeral shortcut: create, start, attach console, wait for
-// the command to finish, stop the VM, and clean up.
-func (m *Manager) Run(ctx context.Context, command string) (int, error) {
-	vmState, err := m.Create(ctx, CreateOpts{Command: command, Ephemeral: true})
-	if err != nil {
-		return 1, err
-	}
-
-	vmCfg := stateToVMConfig(vmState)
-	vm := stateToVM(vmState)
-
-	if err := m.backend.Start(ctx, vm, vmCfg); err != nil {
-		m.backend.Destroy(ctx, vm)
-		os.RemoveAll(m.store.VMDir(vmState.ID))
-		return 1, fmt.Errorf("start vm: %w", err)
-	}
-
-	username := "root"
-	if len(vmState.Users) > 0 {
-		username = vmState.Users[0].Name
-	}
-
-	// SSH session — run the command and get exit code directly.
-	exitCode, _ := m.backend.Attach(ctx, vm, vmState.SSHKeyPath, username, command)
-
-	// Always stop + cleanup for ephemeral VMs.
-	m.backend.Stop(ctx, vm)
-	waitForExit(vm.Pid, 10*time.Second)
-	m.backend.Destroy(ctx, vm)
-	os.RemoveAll(m.store.VMDir(vmState.ID))
-
-	return exitCode, nil
-}
 
 // Rebuild stops the VM (if running), re-extracts the initrd, and updates the
 // VM config (memory, cpus, mounts, ports, env, users, shell) from the current

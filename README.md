@@ -135,8 +135,6 @@ restart = true
 | `mvm ssh`                          | SSH into a running VM                                  |
 | `mvm ssh --code`                   | Open VS Code connected to the VM                       |
 | `mvm ssh --zed`                    | Open Zed connected to the VM                           |
-| `mvm run -- <cmd>`                 | Run a command in an ephemeral VM                       |
-| `mvm shell`                        | Start an interactive shell (alias for `run`)           |
 | `mvm ps`                           | List VMs                                               |
 | `mvm create`                       | Create a VM without starting it                        |
 | `mvm start <id>`                   | Start a created/stopped VM                             |
