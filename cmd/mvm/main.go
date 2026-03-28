@@ -20,6 +20,12 @@ import (
 )
 
 var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
+var (
 	flagImage  string
 	flagMemory string
 	flagCPUs   int
@@ -111,6 +117,14 @@ var buildCmd = &cobra.Command{
 	Use:   "build",
 	Short: "Pre-cache kernel and rootfs without running a VM",
 	RunE:  runBuild,
+}
+
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "Print version information",
+	Run: func(cmd *cobra.Command, args []string) {
+		fmt.Printf("mvm %s (commit: %s, built: %s)\n", version, commit, date)
+	},
 }
 
 var upCmd = &cobra.Command{
@@ -226,6 +240,7 @@ func init() {
 	rootCmd.AddCommand(kernelCmd)
 	kernelCmd.AddCommand(kernelPullCmd)
 	kernelCmd.AddCommand(kernelListCmd)
+	rootCmd.AddCommand(versionCmd)
 }
 
 func loadConfig() (*config.Config, string, error) {
