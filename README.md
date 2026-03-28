@@ -78,7 +78,7 @@ The `.mvm` file lives in your project root. You can also set global defaults in 
 ```toml
 [vm]
 image = "alpine:latest"
-kernel = "ghcr.io/mvm/kernel:latest"
+kernel = "ghcr.io/cvhariharan/mvm-kernel:latest"
 memory = "512M"
 cpus = 2
 shell = "bash"
