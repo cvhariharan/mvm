@@ -21,8 +21,7 @@ func checkPortFree(port int) error {
 
 func buildArgs(cfg *backend.VMConfig, vm *backend.VM) ([]string, error) {
 	args := []string{
-		"-M", "microvm",
-		"-enable-kvm",
+		"-M", "microvm,accel=kvm",
 		"-cpu", "host",
 		"-m", cfg.Memory,
 		"-smp", fmt.Sprintf("%d", cfg.CPUs),
