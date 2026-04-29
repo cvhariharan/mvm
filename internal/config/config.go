@@ -1,14 +1,8 @@
+// Package config defines the on-disk schema for an mvm configuration. Loading
+// and persisting is handled by the CLI in cmd/mvm; this package intentionally
+// has no I/O so that library consumers can populate
+// Config programmatically without pulling in a TOML parser.
 package config
-
-import (
-	"os"
-	"path/filepath"
-
-	"github.com/knadh/koanf/parsers/toml"
-	"github.com/knadh/koanf/providers/confmap"
-	"github.com/knadh/koanf/providers/file"
-	"github.com/knadh/koanf/v2"
-)
 
 const (
 	DefaultKernel  = "ghcr.io/mvm/kernel:latest"
@@ -84,83 +78,23 @@ type CacheConfig struct {
 	Dir string `koanf:"dir"`
 }
 
-var defaults = map[string]interface{}{
-	"vm.image":     DefaultImage,
-	"vm.kernel":    DefaultKernel,
-	"vm.memory":    DefaultMemory,
-	"vm.cpus":      DefaultCPUs,
-	"vm.backend":   DefaultBackend,
-	"vm.shell":     DefaultShell,
-	"vm.disk":      DefaultDisk,
-	"network.mode": DefaultNetMode,
-	"network.dns":  DefaultDNS,
-}
-
-// Load reads config with layered merging: defaults → global → project.
-func Load(projectDir string) (*Config, error) {
-	k := koanf.New(".")
-	parser := toml.Parser()
-
-	if err := k.Load(confmap.Provider(defaults, "."), nil); err != nil {
-		return nil, err
+// Defaults returns a Config populated with the package defaults. Library
+// consumers building a Config programmatically should start from this and
+// override only the fields they care about.
+func Defaults() Config {
+	return Config{
+		VM: VMConfig{
+			Image:   DefaultImage,
+			Kernel:  DefaultKernel,
+			Memory:  DefaultMemory,
+			CPUs:    DefaultCPUs,
+			Backend: DefaultBackend,
+			Shell:   DefaultShell,
+			Disk:    DefaultDisk,
+		},
+		Network: NetworkConfig{
+			Mode: DefaultNetMode,
+			DNS:  DefaultDNS,
+		},
 	}
-	if home, err := os.UserHomeDir(); err == nil {
-		globalPath := filepath.Join(home, ".config", "mvm", "config.toml")
-		if _, err := os.Stat(globalPath); err == nil {
-			if err := k.Load(file.Provider(globalPath), parser); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	projectPath := filepath.Join(projectDir, ConfigFile)
-	if _, err := os.Stat(projectPath); err == nil {
-		if err := k.Load(file.Provider(projectPath), parser); err != nil {
-			return nil, err
-		}
-	}
-
-	var cfg Config
-	if err := k.Unmarshal("", &cfg); err != nil {
-		return nil, err
-	}
-
-	return &cfg, nil
-}
-
-// Save writes a default .mvm config file to the given directory.
-func Save(dir string) error {
-	path := filepath.Join(dir, ConfigFile)
-	content := `[vm]
-image = "alpine:latest"
-kernel = "ghcr.io/cvhariharan/mvm-kernel:latest"
-memory = "512M"
-cpus = 2
-shell = "bash"
-disk = "4G"
-
-# [[network.ports]]
-# host = 8080
-# guest = 80
-# protocol = "tcp"  # optional, defaults to "tcp"
-
-[mounts]
-mount_workspace = true
-# [[mounts.entries]]
-# src = "/host/path"
-# dest = "/guest/path"
-# [[mounts.entries]]
-# src = "/host/path/to/file"
-# dest = "/guest/path/to/file"
-# is_file = true
-
-[env]
-# KEY = "value"
-
-# [[services]]
-# name = "dockerd"
-# cmd = "/usr/bin/dockerd --userland-proxy=false"
-# restart = true
-`
-	return os.WriteFile(path, []byte(content), 0644)
 }

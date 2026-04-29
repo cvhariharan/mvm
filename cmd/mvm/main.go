@@ -11,11 +11,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/cvhariharan/mvm/internal/backend/qemu"
-	"github.com/cvhariharan/mvm/internal/config"
 	"github.com/cvhariharan/mvm/internal/kernel"
-	"github.com/cvhariharan/mvm/internal/state"
-	"github.com/cvhariharan/mvm/internal/vm"
+	"github.com/cvhariharan/mvm/pkg/mvm"
 	"github.com/spf13/cobra"
 )
 
@@ -243,13 +240,13 @@ func init() {
 	rootCmd.AddCommand(versionCmd)
 }
 
-func loadConfig() (*config.Config, string, error) {
+func loadConfig() (*mvm.Config, string, error) {
 	workDir, err := os.Getwd()
 	if err != nil {
 		return nil, "", err
 	}
 
-	cfg, err := config.Load(workDir)
+	cfg, err := loadConfigFile(workDir)
 	if err != nil {
 		return nil, "", fmt.Errorf("load config: %w", err)
 	}
@@ -268,16 +265,16 @@ func loadConfig() (*config.Config, string, error) {
 	return cfg, workDir, nil
 }
 
-func createManager(cfg *config.Config, workDir string) (*vm.Manager, error) {
-	b := qemu.New()
+func createManager(cfg *mvm.Config, workDir string) (*mvm.Manager, error) {
+	b := mvm.NewQEMUBackend()
 	if err := b.Available(); err != nil {
 		return nil, fmt.Errorf("backend not available: %w", err)
 	}
-	store, err := state.NewStore()
+	store, err := mvm.NewStore()
 	if err != nil {
 		return nil, fmt.Errorf("state store: %w", err)
 	}
-	return vm.NewManager(b, cfg, workDir, store), nil
+	return mvm.NewManager(b, cfg, workDir, store), nil
 }
 
 func runUp(cmd *cobra.Command, args []string) error {
@@ -286,7 +283,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	store, err := state.NewStore()
+	store, err := mvm.NewStore()
 	if err != nil {
 		return fmt.Errorf("state store: %w", err)
 	}
@@ -305,7 +302,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 
 	if vmState != nil {
 		switch vmState.Status {
-		case state.StatusRunning:
+		case mvm.StatusRunning:
 			if flagDetach {
 				fmt.Printf("VM %s is already running (workspace: %s)\n", vmState.ID, workDir)
 				return nil
@@ -313,7 +310,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 			fmt.Printf("Re-attaching to running VM %s...\n", vmState.ID)
 			return mgr.AttachConsole(vmState.ID)
 
-		case state.StatusCreated, state.StatusStopped:
+		case mvm.StatusCreated, mvm.StatusStopped:
 			fmt.Printf("Starting VM %s...\n", vmState.ID)
 			exitCode, err := mgr.Start(context.Background(), vmState.ID, foreground)
 			if err != nil {
@@ -334,7 +331,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	vmState, err = mgr.Create(context.Background(), vm.CreateOpts{})
+	vmState, err = mgr.Create(context.Background(), mvm.CreateOpts{})
 	if err != nil {
 		return err
 	}
@@ -370,7 +367,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	vmState, err := mgr.Create(context.Background(), vm.CreateOpts{
+	vmState, err := mgr.Create(context.Background(), mvm.CreateOpts{
 		Name:    flagName,
 		Command: command,
 	})
@@ -427,7 +424,7 @@ func runStop(cmd *cobra.Command, args []string) error {
 	if len(args) == 1 {
 		targetID = args[0]
 	} else {
-		store, err := state.NewStore()
+		store, err := mvm.NewStore()
 		if err != nil {
 			return fmt.Errorf("state store: %w", err)
 		}
@@ -464,7 +461,7 @@ func runAttach(cmd *cobra.Command, args []string) error {
 	if len(args) == 1 {
 		targetID = args[0]
 	} else {
-		store, err := state.NewStore()
+		store, err := mvm.NewStore()
 		if err != nil {
 			return fmt.Errorf("state store: %w", err)
 		}
@@ -504,7 +501,7 @@ func resolveSSHInfo(targetID string) (*sshConnInfo, error) {
 	}
 
 	if targetID == "" {
-		store, err := state.NewStore()
+		store, err := mvm.NewStore()
 		if err != nil {
 			return nil, fmt.Errorf("state store: %w", err)
 		}
@@ -523,7 +520,7 @@ func resolveSSHInfo(targetID string) (*sshConnInfo, error) {
 		return nil, err
 	}
 
-	store, err := state.NewStore()
+	store, err := mvm.NewStore()
 	if err != nil {
 		return nil, fmt.Errorf("state store: %w", err)
 	}
@@ -740,7 +737,7 @@ func runDestroy(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	store, err := state.NewStore()
+	store, err := mvm.NewStore()
 	if err != nil {
 		return fmt.Errorf("state store: %w", err)
 	}
@@ -772,7 +769,7 @@ func runRebuild(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	store, err := state.NewStore()
+	store, err := mvm.NewStore()
 	if err != nil {
 		return fmt.Errorf("state store: %w", err)
 	}
@@ -820,7 +817,7 @@ func runRm(cmd *cobra.Command, args []string) error {
 }
 
 func runPs(cmd *cobra.Command, args []string) error {
-	store, err := state.NewStore()
+	store, err := mvm.NewStore()
 	if err != nil {
 		return err
 	}
@@ -858,12 +855,12 @@ func runInit(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	configPath := filepath.Join(workDir, config.ConfigFile)
+	configPath := filepath.Join(workDir, mvm.ConfigFile)
 	if _, err := os.Stat(configPath); err == nil {
 		return fmt.Errorf(".mvm already exists")
 	}
 
-	if err := config.Save(workDir); err != nil {
+	if err := saveDefaultConfigFile(workDir); err != nil {
 		return fmt.Errorf("failed to create .mvm: %w", err)
 	}
 
