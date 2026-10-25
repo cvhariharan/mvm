@@ -1,6 +1,6 @@
 module github.com/cvhariharan/mvm
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/Microsoft/hcsshim v0.13.0
@@ -14,8 +14,8 @@ require (
 	github.com/schollz/progressbar/v3 v3.19.0
 	github.com/spf13/cobra v1.10.2
 	github.com/u-root/u-root v0.15.0
-	golang.org/x/crypto v0.52.0
-	golang.org/x/term v0.43.0
+	golang.org/x/crypto v0.58.0
+	golang.org/x/term v0.47.0
 )
 
 require (
@@ -41,7 +41,7 @@ require (
 	github.com/jessevdk/go-flags v1.5.0 // indirect
 	github.com/kardianos/osext v0.0.0-20190222173326-2bc1f35cddc0 // indirect
 	github.com/kardianos/service v1.2.0 // indirect
-	github.com/klauspost/compress v1.17.9 // indirect
+	github.com/klauspost/compress v1.18.7 // indirect
 	github.com/knadh/koanf/maps v0.1.2 // indirect
 	github.com/mitchellh/colorstring v0.0.0-20190213212951-d06e56a500db // indirect
 	github.com/mitchellh/copystructure v1.2.0 // indirect
@@ -83,6 +83,6 @@ require (
 	go.opentelemetry.io/otel v1.41.0 // indirect
 	go.opentelemetry.io/otel/metric v1.41.0 // indirect
 	go.opentelemetry.io/otel/trace v1.41.0 // indirect
-	golang.org/x/sys v0.45.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
 	google.golang.org/protobuf v1.35.2 // indirect
 )
